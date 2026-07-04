@@ -48,6 +48,10 @@ if [ "$HAVE_CURL" = 0 ] && [ "$HAVE_WGET" = 0 ]; then
     exit 1
 fi
 
+# 是否连着交互终端:是的话下载时显示原生进度条(百分比/速度/剩余时间),
+# 不是的话(比如日志重定向、CI)保持静默,避免大量 \r 刷新行写进日志文件
+IS_TTY=0; [ -t 1 ] && IS_TTY=1
+
 # 统一的下载函数:自带超时 + 重试,避免网络抖动时脚本直接卡死或静默失败
 # 用法: fetch_with_retry <URL> <输出路径>
 fetch_with_retry() {
@@ -55,9 +59,17 @@ fetch_with_retry() {
     while [ $attempt -lt $max_attempts ]; do
         attempt=$((attempt + 1))
         if [ "$HAVE_CURL" = 1 ]; then
-            curl -fL -sS --connect-timeout 10 --max-time 120 --retry 2 --retry-delay 2 -o "$out" "$url" && return 0
+            if [ "$IS_TTY" = 1 ]; then
+                curl -fL --progress-bar --connect-timeout 10 --max-time 120 --retry 2 --retry-delay 2 -o "$out" "$url" && return 0
+            else
+                curl -fL -sS --connect-timeout 10 --max-time 120 --retry 2 --retry-delay 2 -o "$out" "$url" && return 0
+            fi
         else
-            wget -q -T 10 -t 1 -O "$out" "$url" && return 0
+            if [ "$IS_TTY" = 1 ]; then
+                wget -T 10 -t 1 -O "$out" "$url" && return 0
+            else
+                wget -q -T 10 -t 1 -O "$out" "$url" && return 0
+            fi
         fi
         yellow "下载失败(第 ${attempt} 次): ${url}，2秒后重试..."
         sleep 2
@@ -290,6 +302,14 @@ case "$ACTION" in
     update) purple "模式: 强制更新(重新下载 xray/cloudflared 二进制,沿用已保存的配置并重启)" ;;
 esac
 
+# serv00 多一步"安装保活服务",VPS 没有这一步
+[ "$PLATFORM" = "serv00" ] && TOTAL_STEPS=7 || TOTAL_STEPS=6
+STEP_NUM=0
+step() {
+    STEP_NUM=$((STEP_NUM + 1))
+    purple "\n[步骤 ${STEP_NUM}/${TOTAL_STEPS}] $1"
+}
+
 # ---------------------------------------------------------------
 # 目录初始化(install/re/update 都要走到这里,de/status 前面已经 exit 了)
 # ---------------------------------------------------------------
@@ -355,6 +375,7 @@ check_port() {
   fi
   purple "vless-argo 使用端口: $PORT"
 }
+step "检测可用端口"
 check_port
 
 # ---------------------------------------------------------------
@@ -400,6 +421,7 @@ EOF
     yellow "当前使用的是token,请在cloudflare后台设置隧道端口为${purple}${PORT}${re}"
   fi
 }
+step "配置 Argo 隧道"
 argo_configure
 wait
 
@@ -422,12 +444,14 @@ download_binaries() {
     if [ -x "${BIN_DIR}/web" ] && [ "$FORCE_REDOWNLOAD" != "1" ]; then
         green "web 已存在,跳过下载(如需强制重下载,用 update 子命令或设置 FORCE_REDOWNLOAD=1)"
     else
+        purple "正在下载 web(xray)..."
         fetch_with_retry "${BASE_URL}/web" "${BIN_DIR}/web" || exit 1
         chmod +x "${BIN_DIR}/web"
     fi
     if [ -x "${BIN_DIR}/bot" ] && [ "$FORCE_REDOWNLOAD" != "1" ]; then
         green "bot 已存在,跳过下载"
     else
+        purple "正在下载 bot(cloudflared)..."
         fetch_with_retry "${BASE_URL}/server" "${BIN_DIR}/bot" || exit 1
         chmod +x "${BIN_DIR}/bot"
     fi
@@ -443,14 +467,17 @@ download_binaries() {
     if [ -x "${BIN_DIR}/xray-core/xray" ] && [ "$FORCE_REDOWNLOAD" != "1" ]; then
         green "xray 已存在,跳过下载(如需强制重下载,用 update 子命令或设置 FORCE_REDOWNLOAD=1)"
     else
+        purple "正在查询 Xray-core 最新版本号(GitHub API)..."
         fetch_with_retry "https://api.github.com/repos/XTLS/Xray-core/releases/latest" "${BIN_DIR}/xray_latest.json" || exit 1
         XRAY_VER=$(grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' "${BIN_DIR}/xray_latest.json" | head -n1 | cut -d'"' -f4)
         rm -f "${BIN_DIR}/xray_latest.json"
         [ -z "$XRAY_VER" ] && { red "获取 Xray-core 版本号失败(可能是 GitHub API 限流或网络问题),请检查网络后重试"; exit 1; }
 
+        purple "正在下载 Xray-core ${XRAY_VER} (约10-20MB,视网络情况需要几秒到几十秒)..."
         fetch_with_retry "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VER}/Xray-linux-${XARCH}.zip" "${BIN_DIR}/xray.zip" || exit 1
 
         # 校验和验证:需要本机有 sha256sum 且能拿到官方 .dgst 摘要文件,任一条件不满足则跳过校验(不阻断部署,只是降级为无校验下载)
+        purple "正在校验 Xray-core 完整性..."
         if command -v sha256sum >/dev/null 2>&1 && fetch_with_retry "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VER}/Xray-linux-${XARCH}.zip.dgst" "${BIN_DIR}/xray.zip.dgst"; then
             expected_sha256=$(grep -i '^SHA256' "${BIN_DIR}/xray.zip.dgst" | awk '{print $NF}')
             actual_sha256=$(sha256sum "${BIN_DIR}/xray.zip" | awk '{print $1}')
@@ -474,12 +501,14 @@ download_binaries() {
     if [ -x "${BIN_DIR}/cloudflared" ] && [ "$FORCE_REDOWNLOAD" != "1" ]; then
         green "cloudflared 已存在,跳过下载"
     else
+        purple "正在下载 cloudflared (约40-50MB,是本脚本里最大的一个文件,请耐心等待)..."
         fetch_with_retry "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}" "${BIN_DIR}/cloudflared" || exit 1
         chmod +x "${BIN_DIR}/cloudflared"
     fi
     CLOUDFLARED_BIN="${BIN_DIR}/cloudflared"
   fi
 }
+step "下载并校验核心程序(网络耗时最长的一步,请耐心等待)"
 download_binaries
 wait
 
@@ -526,6 +555,7 @@ generate_config() {
 }
 EOF
 }
+step "生成节点配置"
 generate_config
 wait
 
@@ -672,6 +702,7 @@ EOF
     fi
   fi
 }
+step "启动服务"
 start_services
 save_state
 
@@ -682,6 +713,7 @@ get_argodomain() {
   if [[ -n $ARGO_AUTH ]]; then
     echo "$ARGO_DOMAIN"
   else
+    purple "正在等待 Cloudflare 分配临时隧道域名(最多等待约 6 秒)..." >&2
     local retry=0 max_retries=6 argodomain=""
     while [[ $retry -lt $max_retries ]]; do
         ((retry++))
@@ -703,6 +735,7 @@ install_keepalive() {
     devil www add "keep.${USERNAME}.${CURRENT_DOMAIN}" nodejs /usr/local/bin/node18 > /dev/null 2>&1
     keep_path="$HOME/domains/keep.${USERNAME}.${CURRENT_DOMAIN}/public_nodejs"
     [ -d "$keep_path" ] || mkdir -p "$keep_path"
+    purple "正在下载保活脚本..."
     fetch_with_retry "https://xray.ssss.nyc.mn/vmess.js" "${keep_path}/app.js"
 
     cat > "${keep_path}/.env" <<EOF
@@ -721,6 +754,7 @@ EOF
     npm config set prefix '~/.npm-global'
     echo 'export PATH=~/.npm-global/bin:~/bin:$PATH' >> "$HOME/.bash_profile" && source "$HOME/.bash_profile"
     rm -rf "$HOME/.npmrc" > /dev/null 2>&1
+    purple "正在安装 npm 依赖(dotenv/axios),共享主机上这一步可能比较慢..."
     (cd "${keep_path}" && npm install dotenv axios --silent > /dev/null 2>&1)
     rm -f "$HOME/domains/keep.${USERNAME}.${CURRENT_DOMAIN}/public_nodejs/public/index.html" > /dev/null 2>&1
     devil www restart "keep.${USERNAME}.${CURRENT_DOMAIN}" > /dev/null 2>&1
@@ -753,6 +787,7 @@ generate_links() {
   if [ "$PLATFORM" = "serv00" ]; then
     green "\n订阅链接: https://${USERNAME}.${CURRENT_DOMAIN}/${SUB_TOKEN}_vless.log\n"
     rm -rf "${BIN_DIR}/config.json" "${WORKDIR}/boot.log" "${BIN_DIR}/tunnel.json" "${BIN_DIR}/tunnel.yml"
+    step "安装保活服务"
     install_keepalive
   else
     green "\n节点信息已保存到: ${FILE_PATH}/${SUB_TOKEN}_vless.log"
@@ -760,6 +795,7 @@ generate_links() {
     yellow "如需通过域名访问该订阅文件,请自行用 Nginx/Caddy 反代 ${FILE_PATH} 目录。\n"
   fi
 }
+step "生成订阅链接"
 generate_links
 
 case "$ACTION" in
