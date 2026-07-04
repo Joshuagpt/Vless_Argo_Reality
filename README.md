@@ -1,4 +1,4 @@
-<h2>- Named Tunnel</h2>
+<h2>✅ Named Tunnel</h2>
 
 
 ```bash
@@ -7,7 +7,7 @@ VLESS_PORT="..." UUID="..." ARGO_DOMAIN="..." ARGO_AUTH="..." bash <(curl -Ls ht
 
 > 
 
-<h2>Reload&Refresh</h2>
+<h2>- Reload&Refresh</h2>
 
 
 ```bash
@@ -16,7 +16,7 @@ VLESS_PORT="..." UUID="..." ARGO_DOMAIN="..." ARGO_AUTH="..." bash <(curl -Ls ht
 
 > 
 
-<h2>Delete&Cleanup</h2>
+<h2>- Delete&Cleanup</h2>
 
 
 ```bash
@@ -25,7 +25,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/Joshuagpt/Vless_Argo/main/Vles
 
 > 
 
-<h2>TG Bot</h2>
+<h2>- TG Bot</h2>
 
 
 ```bash
@@ -34,7 +34,7 @@ TG_TOKEN="..." TG_ID="..." VLESS_PORT="..." UUID="..." ARGO_DOMAIN="..." ARGO_AU
 
 >
 
-<h2>- Quick Tunnel</h2>
+<h2>✅ Quick Tunnel</h2>
 
 
 ```bash
