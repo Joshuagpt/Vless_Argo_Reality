@@ -30,6 +30,7 @@ export LC_ALL=C
 # 用法示例:
 #   bash <(curl -Ls .../Vless_Argo.sh)                                       # 安装
 #   VLESS_PORT=9443 UUID=xxx bash <(curl -Ls .../Vless_Argo.sh) re           # 改参数重装(沿用未指定的旧配置)
+#   WARP=1 bash <(curl -Ls .../Vless_Argo.sh) re                             # 开启WARP出站(自动注册,仅注册一次,以后re/update自动复用)
 #   bash <(curl -Ls .../Vless_Argo.sh) update                                # 强制重新下载二进制并重启
 #   bash <(curl -Ls .../Vless_Argo.sh) status                                # 查看当前配置和运行状态
 #   bash <(curl -Ls .../Vless_Argo.sh) de                                    # 卸载并清理
@@ -182,7 +183,10 @@ SAVED_TG_TOKEN=$(printf '%q' "$TG_TOKEN")
 SAVED_TG_ID=$(printf '%q' "$TG_ID")
 SAVED_BOT_ARGS=$(printf '%q' "$args")
 SAVED_WORKDIR=$(printf '%q' "$WORKDIR")
+SAVED_WARP=$(printf '%q' "$WARP")
 EOF
+    # STATE_FILE 里明文保存了 TG_TOKEN 等敏感信息,收紧权限避免同机其他用户读取
+    chmod 600 "$STATE_FILE" >/dev/null 2>&1
 }
 get_xray_version_string() {
     if [ "$PLATFORM" = "vps" ] && [ -x "${BIN_DIR}/xray-core/xray" ]; then
@@ -285,6 +289,16 @@ export VLESS_PORT=${VLESS_PORT:-${SAVED_PORT:-'443'}}
 export TG_TOKEN=${TG_TOKEN:-${SAVED_TG_TOKEN:-''}}
 export TG_ID=${TG_ID:-${SAVED_TG_ID:-''}}
 
+# WARP 出站开关: 严格等于 "1" 才算开启,其余任何情况(未设置/"0"/空/拼错的其他值)一律按关闭处理,
+# 白名单式判断,避免手滑传错值时被误判成开启从而触发注册流程
+_WARP_RAW=${WARP:-${SAVED_WARP:-'0'}}
+if [ "$_WARP_RAW" = "1" ]; then
+    export WARP=1
+else
+    export WARP=0
+fi
+WARP_PROFILE="${BIN_DIR}/warp.json"
+
 # ---------------------------------------------------------------
 # status 模式: 只读查看,不改动任何东西
 # ---------------------------------------------------------------
@@ -314,6 +328,15 @@ do_status() {
         fi
     else
         echo "TG心跳监控   : 未启用(设置 TG_TOKEN + TG_ID 环境变量后重新执行即可自动开启)"
+    fi
+    if [ "$WARP" = "1" ]; then
+        if [ -f "$WARP_PROFILE" ]; then
+            green "WARP出站     : 已启用(凭据: ${WARP_PROFILE})"
+        else
+            yellow "WARP出站     : 已请求启用,但尚未找到凭据文件(可能上次注册失败,重新执行脚本会再次尝试注册)"
+        fi
+    else
+        echo "WARP出站     : 未启用(设置 WARP=1 环境变量后重新执行即可自动注册并开启)"
     fi
     echo "---------------------------------------------------------------"
     if [ "$PLATFORM" = "serv00" ]; then
@@ -352,6 +375,7 @@ esac
 
 # serv00 多一步"安装保活服务",VPS 没有这一步
 [ "$PLATFORM" = "serv00" ] && TOTAL_STEPS=7 || TOTAL_STEPS=6
+[ "$WARP" = "1" ] && TOTAL_STEPS=$((TOTAL_STEPS + 1))
 STEP_NUM=0
 step() {
     STEP_NUM=$((STEP_NUM + 1))
@@ -367,7 +391,9 @@ if [ "$PLATFORM" = "serv00" ]; then
     graceful_kill_pidfile "${BIN_DIR}/bot.pid"
     safe_rm "$WORKDIR" "$FILE_PATH"
     mkdir -p "$WORKDIR" "$FILE_PATH" "$BIN_DIR"
-    chmod 777 "$WORKDIR" "$FILE_PATH" >/dev/null 2>&1
+    # 755 而不是 777: public_html 需要让 devil 起的 web 服务进程能"读"到订阅文件,
+    # 但不应该允许同机其他用户"写"这个目录(777 会导致任意用户可篡改/植入文件)
+    chmod 755 "$WORKDIR" "$FILE_PATH" >/dev/null 2>&1
 else
     mkdir -p "$WORKDIR" "$FILE_PATH" "$BIN_DIR"
 fi
@@ -389,11 +415,21 @@ check_port() {
     udp_ports=$(echo "$port_list" | grep -c "udp")
 
     if [[ $tcp_ports -lt 1 ]]; then
-        red "没有可用的TCP端口,正在调整..."
+        red "没有可用的TCP端口,需要自动调整端口配额(此操作具有破坏性,会删除一个现有UDP端口并断开当前SSH会话)"
         if [[ $udp_ports -ge 3 ]]; then
+            if [ "$ALLOW_PORT_ADJUST" != "1" ]; then
+                red "即将删除的UDP端口可能正被你其他服务占用,脚本不会未经确认擅自删除。"
+                red "如确认可以删除一个现有UDP端口来腾出TCP配额,请加上环境变量 ALLOW_PORT_ADJUST=1 重新运行本脚本。"
+                exit 1
+            fi
             udp_port_to_delete=$(echo "$port_list" | awk '/udp/ {print $1}' | head -n 1)
+            yellow "5秒后将删除UDP端口: $udp_port_to_delete (Ctrl+C 可取消)"
+            sleep 5
             devil port del udp $udp_port_to_delete
             green "已删除udp端口: $udp_port_to_delete"
+        else
+            red "UDP端口数不足3个,无法通过删除UDP端口来腾出TCP配额,请手动在devil面板处理后重试"
+            exit 1
         fi
         while true; do
             tcp_port=$(shuf -i 10000-65535 -n 1)
@@ -406,8 +442,12 @@ check_port() {
                 yellow "端口 $tcp_port 不可用,尝试其他端口..."
             fi
         done
-        green "端口已调整完成, 将断开SSH连接, 请重新连接SSH并重新执行脚本"
         devil binexec on >/dev/null 2>&1
+        # serv00 的已知限制: 新分配的 TCP 端口往往要断开当前 SSH 会话重新连接后才会真正生效,
+        # 这里主动杀掉父进程(SSH shell)逼迫断线,不是误操作,是社区里对付这个限制的规避手段;
+        # 由于会直接掐断当前会话,提前给出明显倒计时提示,避免用户一头雾水
+        red "端口已调整完成! 5秒后将主动断开当前SSH连接以使新端口生效,请重新连接SSH后再次执行本脚本"
+        sleep 5
         kill -9 $(ps -o ppid= -p $$) >/dev/null 2>&1
     else
         tcp_port1=$(echo "$port_list" | awk '/tcp/ {print $1}' | sed -n '1p')
@@ -427,15 +467,43 @@ step "检测可用端口"
 check_port
 
 # ---------------------------------------------------------------
+# 统一判断 ARGO_AUTH 属于哪种模式,避免同一个正则/关键字判断在
+# argo_configure / start_services(serv00) / start_services(VPS) 三处重复。
+#   token        : Cloudflare Zero Trust 后台生成的 Tunnel Token(纯 base64 风格长字符串)
+#   tunnelsecret : cloudflared tunnel create 生成的 JSON 凭证(含 TunnelSecret 字段)
+#   quick        : 未设置 ARGO_AUTH/ARGO_DOMAIN,退回临时隧道
+# ---------------------------------------------------------------
+# 注意: 故意不用 "echo 结果 + $(...)  命令替换" 的写法——那样 detect_argo_mode
+# 会在子 shell 里执行,函数内部的 exit 1 只能杀掉子 shell,报错信息(red 的输出)
+# 还会被一起捕获进返回值里,导致外层拿到的 ARGO_MODE 变成一堆颜色转义序列而不是
+# 预期的 token/tunnelsecret/quick,并且校验失败时脚本根本不会真正退出。
+# 所以这里直接设置全局变量 ARGO_MODE,调用处直接读取该变量,不做命令替换。
+detect_argo_mode() {
+    if [[ -z $ARGO_AUTH || -z $ARGO_DOMAIN ]]; then
+        ARGO_MODE="quick"
+    elif [[ $ARGO_AUTH =~ TunnelSecret ]]; then
+        ARGO_MODE="tunnelsecret"
+    elif [[ $ARGO_AUTH =~ ^[A-Za-z0-9=]{120,250}$ ]]; then
+        ARGO_MODE="token"
+    else
+        # 两种已知格式都不匹配时,不要静默当成 quick tunnel(会导致用户以为自己配置生效了,
+        # 实际上却在用临时隧道),明确报错让用户检查 ARGO_AUTH 内容
+        red "无法识别 ARGO_AUTH 的格式(既不是 Tunnel Token,也不是包含 TunnelSecret 的 JSON 凭证),请检查该值是否正确"
+        exit 1
+    fi
+}
+
+# ---------------------------------------------------------------
 # Argo 隧道配置(两平台共用同一份逻辑,只是文件落地目录不同)
 # ---------------------------------------------------------------
 argo_configure() {
-  if [[ -z $ARGO_AUTH || -z $ARGO_DOMAIN ]]; then
+  detect_argo_mode
+  if [ "$ARGO_MODE" = "quick" ]; then
     green "ARGO_DOMAIN 或 ARGO_AUTH 为空,使用临时隧道(quick tunnel)"
     return
   fi
 
-  if [[ $ARGO_AUTH =~ TunnelSecret ]]; then
+  if [ "$ARGO_MODE" = "tunnelsecret" ]; then
     echo $ARGO_AUTH > "${BIN_DIR}/tunnel.json"
 
     # 提取 TunnelID:优先用 python3 做正规 JSON 解析,不依赖字段固定顺序;
@@ -471,7 +539,6 @@ EOF
 }
 step "配置 Argo 隧道"
 argo_configure
-wait
 
 # ---------------------------------------------------------------
 # 下载核心程序
@@ -558,12 +625,206 @@ download_binaries() {
 }
 step "下载并校验核心程序(网络耗时最长的一步,请耐心等待)"
 download_binaries
-wait
+
+# ---------------------------------------------------------------
+# WARP 出站: 平台能力检测
+#   VPS   : 官方 Xray-core v1.8+ 默认内置 wireguard outbound,直接放行
+#   serv00: eooce/test 是第三方重命名的 freebsd 二进制,协议支持情况未知,
+#           不能假设它和官方行为一致,必须用 -test 校验模式实测一份最小 wireguard 配置。
+#           探测本身失败(比如二进制根本不认 -test 这个参数)时,出于稳妥也当作不支持处理,
+#           而不是冒险继续——这是可选增强功能,宁可关掉也不要让它拖垮整个安装。
+# ---------------------------------------------------------------
+check_warp_supported() {
+    [ "$WARP" = "1" ] || return 0
+
+    if [ "$PLATFORM" = "vps" ]; then
+        return 0
+    fi
+
+    purple "正在检测当前 serv00 二进制是否支持 WARP(wireguard outbound)..."
+    local test_conf="${BIN_DIR}/.warp_probe.json" probe_out
+    cat > "$test_conf" <<'EOF'
+{
+  "outbounds": [
+    {
+      "protocol": "wireguard",
+      "tag": "warp-probe",
+      "settings": {
+        "secretKey": "wIol6i8Wl4Wp+i6PXVXwZBoTr6Ez2FZ3+Rjez7cvvV0=",
+        "address": ["172.16.0.2/32"],
+        "peers": [
+          { "publicKey": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=", "endpoint": "162.159.192.1:2408" }
+        ]
+      }
+    }
+  ]
+}
+EOF
+    probe_out=$("${BIN_DIR}/web" run -test -c "$test_conf" 2>&1)
+    rm -f "$test_conf"
+
+    if echo "$probe_out" | grep -qiE "unknown (outbound )?protocol|not registered|invalid protocol|unknown config"; then
+        red "当前 serv00 平台使用的二进制不支持 WARP(wireguard)出站,已自动关闭 WARP,其余部分正常安装"
+        export WARP=0
+        return 1
+    fi
+    if echo "$probe_out" | grep -qiE "flag provided but not defined|unknown (flag|command)|no such (flag|command)"; then
+        red "当前 serv00 二进制不支持 -test 配置校验模式,无法安全确认 WARP 是否受支持,出于稳妥考虑已自动关闭 WARP"
+        export WARP=0
+        return 1
+    fi
+    green "WARP(wireguard outbound)探测通过"
+}
+
+# ---------------------------------------------------------------
+# WARP 出站: 自动注册凭据(仅在 WARP=1 且尚未注册过时执行)
+#   - 已存在 WARP_PROFILE 时直接复用,绝不重复注册,避免每次 re/update 都换一个新账号
+#   - 需要生成 X25519 密钥对: 用 openssl 生成后直接从 DER 编码尾部截取 32 字节原始密钥,
+#     不依赖额外的 wg 命令行工具(共享主机上大概率没有)
+#   - 注册走的是 Cloudflare WARP 客户端使用的非公开接口,不是正式公开 API,
+#     接口细节以后可能变化,因此注册/解析失败时一律优雅降级为关闭 WARP,不阻断其余部分的安装
+# ---------------------------------------------------------------
+warp_register() {
+    [ "$WARP" = "1" ] || return 0
+
+    if [ -f "$WARP_PROFILE" ]; then
+        purple "检测到已保存的 WARP 账号凭据,直接复用: ${WARP_PROFILE}(不会重新注册)"
+        return 0
+    fi
+
+    purple "未找到已保存的 WARP 账号,正在自动注册一个新账号..."
+
+    if ! command -v openssl >/dev/null 2>&1; then
+        red "未找到 openssl,无法生成 WARP 所需的密钥对,WARP 出站功能已跳过(其余部分正常安装)"
+        export WARP=0; return 1
+    fi
+
+    local py_bin=""
+    if command -v python3 >/dev/null 2>&1; then
+        py_bin="python3"
+    else
+        (apt-get update -y && apt-get install -y python3) >/dev/null 2>&1 \
+            || yum install -y python3 >/dev/null 2>&1 \
+            || apk add --no-cache python3 >/dev/null 2>&1
+        command -v python3 >/dev/null 2>&1 && py_bin="python3"
+    fi
+    if [ -z "$py_bin" ]; then
+        red "未找到 python3 且自动安装失败(解析注册结果需要用到),WARP 出站功能已跳过"
+        export WARP=0; return 1
+    fi
+
+    local tmpdir priv_pem priv_key_b64 pub_key_b64
+    tmpdir=$(mktemp -d 2>/dev/null || echo "${BIN_DIR}/.warp_tmp")
+    mkdir -p "$tmpdir"
+    priv_pem="${tmpdir}/priv.pem"
+    openssl genpkey -algorithm X25519 -out "$priv_pem" >/dev/null 2>&1
+    if [ ! -s "$priv_pem" ]; then
+        red "生成 WireGuard 密钥对失败(openssl 版本可能过旧,不支持 X25519),WARP 出站功能已跳过"
+        rm -rf "$tmpdir"; export WARP=0; return 1
+    fi
+    priv_key_b64=$(openssl pkey -in "$priv_pem" -outform DER 2>/dev/null | tail -c 32 | base64 | tr -d '\n')
+    pub_key_b64=$(openssl pkey -in "$priv_pem" -pubout -outform DER 2>/dev/null | tail -c 32 | base64 | tr -d '\n')
+    rm -rf "$tmpdir"
+    if [ -z "$priv_key_b64" ] || [ -z "$pub_key_b64" ]; then
+        red "提取 WireGuard 密钥失败,WARP 出站功能已跳过"
+        export WARP=0; return 1
+    fi
+
+    local reg_resp="${BIN_DIR}/.warp_reg_resp.json" tos_ts body
+    tos_ts=$(date -u +%Y-%m-%dT%H:%M:%S.000Z 2>/dev/null || echo "2024-01-01T00:00:00.000Z")
+    body=$(printf '{"key":"%s","tos":"%s","type":"PC","model":"PC","locale":"en_US"}' "$pub_key_b64" "$tos_ts")
+
+    if [ "$HAVE_CURL" = 1 ]; then
+        curl -fsSL -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
+            -H "Content-Type: application/json" -H "User-Agent: okhttp/3.12.1" \
+            -d "$body" -o "$reg_resp" --connect-timeout 10 --max-time 20
+    else
+        wget -q -T 20 --header="Content-Type: application/json" --header="User-Agent: okhttp/3.12.1" \
+            --post-data="$body" -O "$reg_resp" "https://api.cloudflareclient.com/v0a2158/reg"
+    fi
+
+    if [ ! -s "$reg_resp" ]; then
+        red "WARP 账号注册请求失败(网络问题或接口暂不可达),WARP 出站功能已跳过"
+        rm -f "$reg_resp"; export WARP=0; return 1
+    fi
+
+    "$py_bin" - "$reg_resp" "$priv_key_b64" > "${WARP_PROFILE}.tmp" <<'PYEOF'
+import json, base64, sys
+resp_path, priv_key = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(open(resp_path))
+    cfg = d["config"]
+    peer = cfg["peers"][0]
+    client_id_b64 = cfg.get("client_id", "")
+    pad = client_id_b64 + "=" * (-len(client_id_b64) % 4)
+    raw = base64.b64decode(pad) if client_id_b64 else b"\x00\x00\x00"
+    reserved = ",".join(str(b) for b in raw[:3])
+    v4 = cfg.get("interface", {}).get("addresses", {}).get("v4", "")
+    v6 = cfg.get("interface", {}).get("addresses", {}).get("v6", "")
+    endpoint = peer.get("endpoint", {}).get("host") or "engage.cloudflareclient.com:2408"
+    print("WARP_PRIVATE_KEY=%r" % priv_key)
+    print("WARP_ADDRESS_V4=%r" % v4)
+    print("WARP_ADDRESS_V6=%r" % v6)
+    print("WARP_PEER_PUBLIC_KEY=%r" % peer["public_key"])
+    print("WARP_ENDPOINT=%r" % endpoint)
+    print("WARP_RESERVED=%r" % reserved)
+except Exception as e:
+    sys.stderr.write("parse_error: %s\n" % e)
+    sys.exit(1)
+PYEOF
+    local parse_rc=$?
+    rm -f "$reg_resp"
+
+    if [ "$parse_rc" -ne 0 ] || [ ! -s "${WARP_PROFILE}.tmp" ]; then
+        red "解析 WARP 注册返回结果失败(接口返回格式可能已变化),WARP 出站功能已跳过"
+        rm -f "${WARP_PROFILE}.tmp"; export WARP=0; return 1
+    fi
+
+    mv "${WARP_PROFILE}.tmp" "$WARP_PROFILE"
+    chmod 600 "$WARP_PROFILE" >/dev/null 2>&1
+    green "WARP 账号注册成功,凭据已保存到 ${WARP_PROFILE}(以后 re/update 会直接复用,不会重新注册)"
+}
+if [ "$WARP" = "1" ]; then
+    step "配置 WARP 出站(平台兼容性检测 + 账号凭据)"
+    check_warp_supported
+    warp_register
+fi
 
 # ---------------------------------------------------------------
 # 生成 Xray 配置(协议改为 vless)
 # ---------------------------------------------------------------
 generate_config() {
+  # WARP=1 且凭据文件存在有效时,才真正拼接 wireguard 出站;
+  # 任何一个条件不满足都安静地退回纯直连(freedom),不生成半残的 WARP 配置
+  local warp_outbound="" warp_routing=""
+  if [ "$WARP" = "1" ] && [ -f "$WARP_PROFILE" ]; then
+    # shellcheck disable=SC1090
+    source "$WARP_PROFILE"
+    if [ -n "$WARP_PRIVATE_KEY" ] && [ -n "$WARP_PEER_PUBLIC_KEY" ]; then
+        warp_outbound=",
+        {
+            \"protocol\": \"wireguard\",
+            \"tag\": \"warp-out\",
+            \"settings\": {
+                \"secretKey\": \"${WARP_PRIVATE_KEY}\",
+                \"address\": [\"${WARP_ADDRESS_V4:-172.16.0.2/32}\", \"${WARP_ADDRESS_V6:-::/128}\"],
+                \"peers\": [
+                    { \"publicKey\": \"${WARP_PEER_PUBLIC_KEY}\", \"endpoint\": \"${WARP_ENDPOINT:-engage.cloudflareclient.com:2408}\" }
+                ],
+                \"reserved\": [${WARP_RESERVED:-0,0,0}],
+                \"mtu\": 1280
+            }
+        }"
+        # 所有非本地流量都走 warp-out;direct 仍保留,供以后需要按域名/IP 分流时使用
+        warp_routing=",
+    \"routing\": {
+        \"rules\": [
+            { \"type\": \"field\", \"outboundTag\": \"warp-out\", \"network\": \"tcp,udp\" }
+        ]
+    }"
+    fi
+  fi
+
   cat > "${BIN_DIR}/config.json" << EOF
 {
     "log": {
@@ -575,7 +836,7 @@ generate_config() {
         {
           "tag": "vless-ws",
           "port": ${PORT},
-          "listen": "0.0.0.0",
+          "listen": "127.0.0.1",
           "protocol": "vless",
           "settings": {
               "clients": [
@@ -598,14 +859,13 @@ generate_config() {
     },
     "outbounds": [
         { "protocol": "freedom", "tag": "direct" },
-        { "protocol": "blackhole", "tag": "blocked" }
-    ]
+        { "protocol": "blackhole", "tag": "blocked" }${warp_outbound}
+    ]${warp_routing}
 }
 EOF
 }
 step "生成节点配置"
 generate_config
-wait
 
 # ---------------------------------------------------------------
 # 启动服务
@@ -628,13 +888,12 @@ start_services() {
         sleep 2
     fi
 
-    if [[ $ARGO_AUTH =~ ^[A-Z0-9a-z=]{120,250}$ ]]; then
-        args="tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token ${ARGO_AUTH}"
-    elif [[ $ARGO_AUTH =~ TunnelSecret ]]; then
-        args="tunnel --edge-ip-version auto --config ${BIN_DIR}/tunnel.yml run"
-    else
-        args="tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --logfile ${WORKDIR}/boot.log --loglevel info --url http://localhost:$PORT"
-    fi
+    detect_argo_mode
+    case "$ARGO_MODE" in
+        token)        args="tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token ${ARGO_AUTH}" ;;
+        tunnelsecret) args="tunnel --edge-ip-version auto --config ${BIN_DIR}/tunnel.yml run" ;;
+        *)            args="tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --logfile ${WORKDIR}/boot.log --loglevel info --url http://localhost:$PORT" ;;
+    esac
     nohup ./bot $args >/dev/null 2>&1 &
     echo $! > "${BIN_DIR}/bot.pid"
     sleep 2
@@ -648,13 +907,12 @@ start_services() {
         sleep 2
     fi
   else
-    if [[ $ARGO_AUTH =~ ^[A-Z0-9a-z=]{120,250}$ ]]; then
-        cf_args="tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token ${ARGO_AUTH}"
-    elif [[ $ARGO_AUTH =~ TunnelSecret ]]; then
-        cf_args="tunnel --edge-ip-version auto --config ${BIN_DIR}/tunnel.yml run"
-    else
-        cf_args="tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --logfile ${WORKDIR}/boot.log --loglevel info --url http://localhost:${PORT}"
-    fi
+    detect_argo_mode
+    case "$ARGO_MODE" in
+        token)        cf_args="tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token ${ARGO_AUTH}" ;;
+        tunnelsecret) cf_args="tunnel --edge-ip-version auto --config ${BIN_DIR}/tunnel.yml run" ;;
+        *)            cf_args="tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --logfile ${WORKDIR}/boot.log --loglevel info --url http://localhost:${PORT}" ;;
+    esac
 
     if [ "$INIT_SYSTEM" = "systemd" ]; then
         cat > /etc/systemd/system/xray-argo.service << EOF
@@ -797,6 +1055,9 @@ install_healthcheck() {
     cat > "$HEALTH_SCRIPT" << 'HEALTHEOF'
 #!/bin/bash
 # 由 vless-argo 主脚本自动生成,请勿手动编辑;重新执行主脚本会覆盖,de 卸载时会自动删除
+# LC_ALL=C: cron/systemd timer 启动的是全新环境,不会继承主脚本 export 的 LC_ALL,
+# 这里必须显式重设,否则下面 urlencode() 按字节遍历中文/emoji 时会出现编码错误
+export LC_ALL=C
 STATE_FILE="__STATE_FILE__"
 PLATFORM="__PLATFORM__"
 INIT_SYSTEM="__INIT_SYSTEM__"
@@ -809,10 +1070,29 @@ source "$STATE_FILE"
 
 TG_TOKEN="$SAVED_TG_TOKEN"
 TG_ID="$SAVED_TG_ID"
-[ -z "$TG_TOKEN" ] || [ -z "$TG_ID" ] && exit 0
+if [ -z "$TG_TOKEN" ] || [ -z "$TG_ID" ]; then
+    exit 0
+fi
 
 # 发送失败(网络超时/被限流等)时重试一次;判断是否成功以 Telegram 返回体里的 "ok":true 为准,
 # 而不是只看 curl/wget 退出码——因为 HTTP 200 但业务失败(比如被限流 429、chat_id 错误)时,退出码通常仍是 0
+
+# 纯 bash 实现的 urlencode,不依赖 python/perl,逐字节处理(兼容 UTF-8 多字节字符,
+# 因为未保留字符会被原样透传,只有 ASCII 保留字符才需要转义,多字节 UTF-8 序列本身
+# 不含这些保留字符,可以安全地按字节遍历)
+urlencode() {
+    local s="$1" out="" c i
+    for (( i = 0; i < ${#s}; i++ )); do
+        c="${s:i:1}"
+        case "$c" in
+            [a-zA-Z0-9.~_-]) out+="$c" ;;
+            *) printf -v hex '%02X' "'$c"
+               out+="%${hex}" ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
 tg_send() {
     local text="$1" attempt=0 ok=1 resp_file
     resp_file="$(mktemp 2>/dev/null || echo "/tmp/.tgresp_$$")"
@@ -825,7 +1105,7 @@ tg_send() {
             grep -q '"ok":true' "$resp_file" 2>/dev/null && ok=0
         elif command -v wget >/dev/null 2>&1; then
             wget -q -T 10 -O "$resp_file" \
-                "https://api.telegram.org/bot${TG_TOKEN}/sendMessage?chat_id=${TG_ID}&text=$(printf '%s' "$text" | sed 's/ /%20/g; s/$/%0A/')" \
+                "https://api.telegram.org/bot${TG_TOKEN}/sendMessage?chat_id=$(urlencode "$TG_ID")&text=$(urlencode "$text")" \
                 >/dev/null 2>&1
             grep -q '"ok":true' "$resp_file" 2>/dev/null && ok=0
         fi
