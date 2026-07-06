@@ -11,7 +11,7 @@ VLESS_PORT="..." UUID="..." ARGO_DOMAIN="..." ARGO_AUTH="..." bash <(curl -Ls ht
 
 
 ```bash
-VLESS_PORT="..." UUID="..." ARGO_DOMAIN="..." ARGO_AUTH="..." bash <(curl -Ls https://raw.githubusercontent.com/Joshuagpt/Vless_Argo_Reality/main/Vless_Argo_Reality.sh)) re
+VLESS_PORT="..." UUID="..." ARGO_DOMAIN="..." ARGO_AUTH="..." bash <(curl -Ls https://raw.githubusercontent.com/Joshuagpt/Vless_Argo_Reality/main/Vless_Argo_Reality.sh) re
 ```
 
 > 
@@ -20,7 +20,7 @@ VLESS_PORT="..." UUID="..." ARGO_DOMAIN="..." ARGO_AUTH="..." bash <(curl -Ls ht
 
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/Joshuagpt/Vless_Argo_Reality/main/Vless_Argo_Reality.sh)) de
+bash <(curl -Ls https://raw.githubusercontent.com/Joshuagpt/Vless_Argo_Reality/main/Vless_Argo_Reality.sh) de
 ```
 
 > 
@@ -29,7 +29,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/Joshuagpt/Vless_Argo_Reality/m
 
 
 ```bash
-REALITY_PORT="..." bash <(curl -Ls https://raw.githubusercontent.com/Joshuagpt/Vless_Argo_Reality/main/Vless_Argo_Reality.sh))
+REALITY_PORT="..." bash <(curl -Ls https://raw.githubusercontent.com/Joshuagpt/Vless_Argo_Reality/main/Vless_Argo_Reality.sh)
 ```
 
 >
@@ -38,7 +38,7 @@ REALITY_PORT="..." bash <(curl -Ls https://raw.githubusercontent.com/Joshuagpt/V
 
 
 ```bash
-WARP="1" bash <(curl -Ls https://raw.githubusercontent.com/Joshuagpt/Vless_Argo_Reality/main/Vless_Argo_Reality.sh))
+WARP="1" bash <(curl -Ls https://raw.githubusercontent.com/Joshuagpt/Vless_Argo_Reality/main/Vless_Argo_Reality.sh)
 ```
 
 >
@@ -47,7 +47,7 @@ WARP="1" bash <(curl -Ls https://raw.githubusercontent.com/Joshuagpt/Vless_Argo_
 
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/Joshuagpt/Vless_Argo_Reality/main/Vless_Argo_Reality.sh))
+bash <(curl -Ls https://raw.githubusercontent.com/Joshuagpt/Vless_Argo_Reality/main/Vless_Argo_Reality.sh)
 ```
 
 > 
@@ -55,7 +55,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/Joshuagpt/Vless_Argo_Reality/m
 <h2>- TG Bot</h2>
 
 ```bash
-TG_TOKEN="..." TG_ID="..." bash <(curl -Ls https://raw.githubusercontent.com/Joshuagpt/Vless_Argo_Reality/main/Vless_Argo_Reality.sh))
+TG_TOKEN="..." TG_ID="..." bash <(curl -Ls https://raw.githubusercontent.com/Joshuagpt/Vless_Argo_Reality/main/Vless_Argo_Reality.sh)
 ```
 >
 
@@ -63,7 +63,7 @@ TG_TOKEN="..." TG_ID="..." bash <(curl -Ls https://raw.githubusercontent.com/Jos
 
 
 ```bash
-UUID= GLOBAL_WARP=true bash <(curl -Ls https://raw.githubusercontent.com/Joshuagpt/Vless_Argo_Reality/main/servct.sh))
+UUID= GLOBAL_WARP=true bash <(curl -Ls https://raw.githubusercontent.com/Joshuagpt/Vless_Argo_Reality/main/servct.sh)
 ```
 
 >
