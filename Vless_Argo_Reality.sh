@@ -978,15 +978,16 @@ fi
 
 purple "xray x25519 输出："
 echo "$keypair"
-            # 兼容两种 xray x25519 输出格式:
+            # 兼容多种 xray x25519 输出格式:
             #   旧版: "Private key: xxx" / "Public key: xxx"
-            #   新版(v25.3.6+): "PrivateKey: xxx" / "Password: xxx"(Password 就是旧版的 Public key,
-            #   官方改名是为了防止有人误以为公钥可以随便分享——它理论上能被用来探测 Reality 服务端)
-            # 用 grep 按关键字取行、sed 去掉行首的 "标签:" 部分,不依赖空格数量,两种格式都能解析
+            #   新版(v25.3.6+): "PrivateKey: xxx" / "Password (PublicKey): xxx"
+            #   (官方把公钥这行改名/加注释是为了提醒用户它能被用来探测 Reality 服务端,不代表可随意分享)
+            # 只按"行首关键字"匹配,不假设关键字和冒号之间的内容(空格、括号注释等),
+            # 取值时直接截掉第一个冒号之前的所有内容,避免因为标签格式变化(如中间插入的括号说明)导致匹配失败
             export REALITY_PRIVATE_KEY
-            REALITY_PRIVATE_KEY=$(echo "$keypair" | grep -iE '^Private[[:space:]]*Key[[:space:]]*:' | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d '[:space:]')
+            REALITY_PRIVATE_KEY=$(echo "$keypair" | grep -iE '^Private' | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d '[:space:]')
             export REALITY_PUBLIC_KEY
-            REALITY_PUBLIC_KEY=$(echo "$keypair" | grep -iE '^(Public[[:space:]]*Key|Password)[[:space:]]*:' | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d '[:space:]')
+            REALITY_PUBLIC_KEY=$(echo "$keypair" | grep -iE '^(Public|Password)' | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d '[:space:]')
             export REALITY_SHORT_ID
             REALITY_SHORT_ID=$(openssl rand -hex 8 2>/dev/null || head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')
             if [ -z "$REALITY_PRIVATE_KEY" ] || [ -z "$REALITY_PUBLIC_KEY" ]; then
