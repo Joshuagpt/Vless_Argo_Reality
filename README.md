@@ -43,6 +43,15 @@ TG_TOKEN="..." TG_ID="..." VLESS_PORT="..." UUID="..." ARGO_DOMAIN="..." ARGO_AU
 
 >
 
+<h2>✅ Reality</h2>
+
+
+```bash
+REALITY_PORT="..." bash <(curl -Ls https://raw.githubusercontent.com/Joshuagpt/Vless_Argo_Reality/main/Vless_Argo_Reality.sh))
+```
+
+>
+
 <h2>✅ Quick Tunnel</h2>
 
 
