@@ -65,6 +65,7 @@ reading "\n确定继续安装吗？(直接回车即确认安装)【y/n】: " cho
     	clear
         check_port
         argo_configure
+        warp_configure
         install_service
       ;;
     [Nn]) exit 0 ;;
@@ -131,10 +132,23 @@ protocol: http2
 ingress:
   - hostname: $ARGO_DOMAIN
     service: http://localhost:$ARGO_PORT
+    originRequest:
+      noTLSVerify: true
   - service: http_status:404
 EOF
   else
     yellow "\n当前使用的是token,请在cloudflare里设置隧道端口为${purple}${ARGO_PORT}${re}"
+  fi
+}
+
+warp_configure() {
+  reading "是否启用全局WARP出站？(直接回车默认不启用,仅Netflix/YouTube走WARP)【y/n】: " warp_choice
+  if [[ "$warp_choice" == "y" || "$warp_choice" == "Y" ]]; then
+    export GLOBAL_WARP=true
+    green "已启用全局WARP出站(所有流量默认走WARP,WARP不可用时自动故障转移到direct)"
+  else
+    export GLOBAL_WARP=false
+    green "未启用全局WARP,默认仅Netflix/YouTube走WARP"
   fi
 }
 
@@ -159,12 +173,15 @@ const path = require('path');
 const os = require('os');
 const http = require('http');
 const crypto = require('crypto');
+const dgram = require('dgram');
 const axios = require('axios');
 const koffi = require('koffi');
+const { execSync } = require('child_process');
 
 try { require('dotenv').config(); } catch { /* ignore if dotenv unavailable */ }
 
 // ======================== 环境变量定义 ========================
+const YT_WARPOUT     = process.env.YT_WARPOUT     || false;      // 设置为true时强制使用warp出站访问youtube
 const FILE_PATH      = process.env.FILE_PATH      || '.npm';     // sub.txt订阅文件路径
 const SUB_PATH       = process.env.SUB_PATH       || 'sub';      // 订阅sub路径，默认为sub
 const UUID           = process.env.UUID           || '68aa231f-703e-4547-967e-12ed0b36420f'; // UUID
@@ -176,6 +193,7 @@ const CFPORT         = Number(process.env.CFPORT) || 443;        // 优选域名
 const PORT           = Number(process.env.PORT)   || 3000;       // http订阅端口
 const NAME           = process.env.NAME           || '';         // 节点名称
 const DISABLE_ARGO   = process.env.DISABLE_ARGO   || false;      // 设置为true时禁用argo
+const GLOBAL_WARP    = process.env.GLOBAL_WARP     || false;     // 设置为true时全部出站流量走WARP，否则仅netflix/youtube走WARP
 // ==============================================================
 
 const ROOT = process.cwd();
@@ -185,7 +203,14 @@ const singBoxConfigPath = path.resolve(runtimeFilePath, 'config.json');
 const bootLogPath = path.resolve(runtimeFilePath, 'boot.log');
 const subPath = path.resolve(runtimeFilePath, 'sub.txt');
 const listPath = path.resolve(runtimeFilePath, 'list.txt');
+const warpConfigPath = path.resolve(runtimeFilePath, 'warp.json'); // 独立WARP身份持久化文件，注册一次后复用
 const subscribePath = '/' + SUB_PATH.replace(/^\//, '');
+
+const arch = (() => {
+  const a = os.arch().toLowerCase();
+  if (a === 'arm64' || a === 'aarch64') return 'arm64';
+  return 'amd64';
+})();
 
 // ======================== 文件清理 ========================
 
@@ -202,7 +227,7 @@ function cleanupOldFiles() {
 }
 
 function cleanupFiles(options = {}) {
-  const keepFiles = new Set([]);
+  const keepFiles = new Set(['warp.json']); // WARP身份文件任何时候都不清理，避免重复注册触发限流
   if (options.keepSub) keepFiles.add('sub.txt');
   if (fs.existsSync(runtimeFilePath)) {
     try {
@@ -233,6 +258,308 @@ function clearConsole() {
   process.stdout.write('\x1Bc');
 }
 
+// ======================== WARP 身份注册 ========================
+// 基于 wgcf 同款接口 (api.cloudflareclient.com/v0a884/reg) 独立注册一个 WARP 身份，
+// 而不是使用写死/共享的 WireGuard 密钥。注册结果落盘到 warp.json，之后每次启动优先复用，
+// 避免频繁注册触发 Cloudflare 风控/限流。
+
+const WARP_REG_URL = 'https://api.cloudflareclient.com/v0a884/reg';
+const WARP_API_HEADERS = {
+  'User-Agent': 'okhttp/3.12.1',
+  'CF-Client-Version': 'a-6.10-2158',
+  'Content-Type': 'application/json;charset=UTF-8'
+};
+
+// 生成一对 X25519 (Curve25519) 密钥，转成 WireGuard 使用的原始 32 字节 base64 格式。
+// Node 的 crypto 模块只能导出 DER 编码，WireGuard 需要的是裸的 32 字节 key，
+// 因此从 DER 结构中截取末尾 32 字节（X25519 DER 编码固定为该结构）。
+function generateWireguardKeyPair() {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync('x25519', {
+    publicKeyEncoding: { type: 'spki', format: 'der' },
+    privateKeyEncoding: { type: 'pkcs8', format: 'der' }
+  });
+  const rawPrivateKey = privateKey.subarray(privateKey.length - 32);
+  const rawPublicKey = publicKey.subarray(publicKey.length - 32);
+  return {
+    privateKey: Buffer.from(rawPrivateKey).toString('base64'),
+    publicKey: Buffer.from(rawPublicKey).toString('base64')
+  };
+}
+
+// 调用 Cloudflare 注册接口，拿到属于自己的 client_id(reserved)、分配的内网地址、以及对端公钥
+async function registerWarp() {
+  const { privateKey, publicKey } = generateWireguardKeyPair();
+
+  const resp = await axios.post(WARP_REG_URL, {
+    key: publicKey,
+    install_id: '',
+    fcm_token: '',
+    tos: new Date().toISOString(),
+    type: 'PC',
+    model: 'PC',
+    locale: 'en_US'
+  }, {
+    headers: WARP_API_HEADERS,
+    timeout: 10000
+  });
+
+  const data = resp.data;
+  if (!data || !data.config || !data.config.peers || !data.config.peers[0]) {
+    throw new Error('WARP注册接口返回数据格式异常');
+  }
+
+  const cfg = data.config;
+  const peer = cfg.peers[0];
+
+  // client_id 是 base64 编码的 3 字节数据，即 reserved 字段
+  const reserved = Array.from(Buffer.from(cfg.client_id, 'base64'));
+
+  // peer.endpoint.host 形如 "engage.cloudflareclient.com:2408" 或 "162.159.192.1:2408"
+  let endpointHost = 'engage.cloudflareclient.com';
+  let endpointPort = 2408;
+  if (peer.endpoint && peer.endpoint.host) {
+    const idx = peer.endpoint.host.lastIndexOf(':');
+    if (idx !== -1) {
+      endpointHost = peer.endpoint.host.slice(0, idx);
+      endpointPort = Number(peer.endpoint.host.slice(idx + 1)) || 2408;
+    } else {
+      endpointHost = peer.endpoint.host;
+    }
+  }
+
+  return {
+    private_key: privateKey,
+    public_key: peer.public_key,
+    endpoint_host: endpointHost,
+    endpoint_port: endpointPort,
+    address_v4: cfg.interface && cfg.interface.addresses ? cfg.interface.addresses.v4 : null,
+    address_v6: cfg.interface && cfg.interface.addresses ? cfg.interface.addresses.v6 : null,
+    reserved,
+    account_id: data.id || null,
+    registered_at: new Date().toISOString()
+  };
+}
+
+// 校验本地 warp.json 内容是否完整可用
+function isValidWarpConfig(cfg) {
+  return !!(cfg && cfg.private_key && cfg.public_key && cfg.endpoint_host &&
+    Array.isArray(cfg.reserved) && cfg.reserved.length === 3 && cfg.address_v4);
+}
+
+// 探测出站 UDP 是否可用：向公共 DNS(1.1.1.1/8.8.8.8) 的 53 端口发一个标准 DNS 查询包，
+// 能收到任意响应即说明本机允许 UDP 出站；serv00/ct8 这类共享托管沙箱通常只放行 TCP，
+// UDP 出站会被直接丢弃，导致 WireGuard(UDP)握手永远无法完成。
+function udpEgressProbe(host, port, timeoutMs) {
+  return new Promise((resolve) => {
+    let socket;
+    try {
+      socket = dgram.createSocket('udp4');
+    } catch (e) {
+      resolve(false);
+      return;
+    }
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { socket.close(); } catch (e) { /* ignore */ }
+      resolve(ok);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    socket.once('error', () => finish(false));
+    socket.once('message', () => finish(true));
+    // 标准 DNS 查询报文：A记录查询 cloudflare.com
+    const query = Buffer.from([
+      0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x0a, 0x63, 0x6c, 0x6f, 0x75, 0x64, 0x66, 0x6c, 0x61, 0x72, 0x65,
+      0x03, 0x63, 0x6f, 0x6d, 0x00,
+      0x00, 0x01, 0x00, 0x01
+    ]);
+    socket.send(query, port, host, (err) => {
+      if (err) finish(false);
+    });
+  });
+}
+
+// 依次探测多个公共UDP目标，任意一个探测成功即认为本机支持UDP出站；全部失败则判定不支持
+async function detectUdpEgress() {
+  console.log('WARP: 正在检测本机出站 UDP 连通性（WireGuard 依赖 UDP）...');
+  const targets = [
+    { host: '1.1.1.1', port: 53 },
+    { host: '8.8.8.8', port: 53 }
+  ];
+  for (const t of targets) {
+    const ok = await udpEgressProbe(t.host, t.port, 3000);
+    console.log(`WARP: UDP探测 ${t.host}:${t.port} -> ${ok ? '成功(有响应)' : '失败(超时/无响应)'}`);
+    if (ok) {
+      console.log('WARP: 检测结果 -> 本机支持出站UDP，将继续安装/使用WARP');
+      return true;
+    }
+  }
+  console.log('WARP: 检测结果 -> 本机不支持出站UDP（大概率是VPS/托管商限制），WireGuard无法工作，将跳过WARP安装，自动使用纯direct出站');
+  return false;
+}
+
+// 针对性探测：给已注册到的真实 WARP endpoint(host:port) 发一个 UDP 包。
+// 注意：WireGuard 协议对非法/无法通过校验的握手包是"静默丢弃、不回应"的，
+// 所以这里只能捕捉到"明确被拒绝"(如ICMP port-unreachable触发的socket error)这种强信号；
+// 收不到任何响应是正常的协议行为，并不能100%证明被墙，只能作为"未见明确拒绝"的弱信号。
+function probeWarpEndpoint(host, port, timeoutMs) {
+  return new Promise((resolve) => {
+    let socket;
+    try {
+      socket = dgram.createSocket('udp4');
+    } catch (e) {
+      resolve('error');
+      return;
+    }
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { socket.close(); } catch (e) { /* ignore */ }
+      resolve(result);
+    };
+    const timer = setTimeout(() => finish('no_response'), timeoutMs);
+    socket.once('error', () => finish('rejected'));
+    socket.once('message', () => finish('responded'));
+    const probe = Buffer.from([0x01, 0x00, 0x00, 0x00, 0x00]); // 无实际意义的探测负载
+    socket.send(probe, port, host, (err) => {
+      if (err) finish('rejected');
+    });
+  });
+}
+
+// 对已拿到的 WARP 身份做一次针对性诊断，仅用于打印更明确的排障信息，不影响是否启用WARP的决策
+async function diagnoseWarpEndpoint(cfg) {
+  console.log(`WARP: 正在针对性探测 WARP 端点 ${cfg.endpoint_host}:${cfg.endpoint_port} ...`);
+  const result = await probeWarpEndpoint(cfg.endpoint_host, cfg.endpoint_port, 3000);
+  if (result === 'responded') {
+    console.log('WARP: 端点探测 -> 收到响应，WARP端点大概率可达');
+  } else if (result === 'rejected') {
+    console.log('WARP: 端点探测 -> 收到明确拒绝(ICMP不可达等)，该VPS/厂商很可能专门限制了WARP端点，即使继续尝试WARP大概率也无法生效');
+  } else {
+    console.log('WARP: 端点探测 -> 未收到任何响应。由于WireGuard对非法握手包本身也不会回应，这不能100%证明被墙，仍会继续尝试使用WARP；如果实际测试WARP始终未生效，大概率是VPS厂商针对性限制了WARP端点(而非通用UDP出站问题)');
+  }
+}
+
+// 真实探测：直接用当前加载的这份 .so 库文件试跑一份只含 wireguard 出站的最小配置，
+// 判断它是否真的认识/支持我们用的这套 wireguard outbound 字段结构。
+// 这等价于社区 Xray-core 脚本里常见的 `-test` 配置校验模式的思路，只是这里没有独立的
+// 校验入口，只能通过“真的调一次 StartSingBox，看返回值，然后立刻 StopSingBox”来验证——
+// 不产生真实监听端口，也不依赖真实注册的密钥（用占位密钥即可，只是为了验证配置结构本身
+// 能不能被正确解析接受，不代表握手一定成功）。
+function probeWireguardOutboundSupport(libraryPath, startSymbol, stopSymbol) {
+  let lib, startFn, stopFn;
+  try {
+    lib = koffi.load(libraryPath);
+    startFn = lib.func(`int ${startSymbol}(str)`);
+    stopFn = lib.func(`int ${stopSymbol}()`);
+  } catch (e) {
+    console.log('WARP: 加载 .so 用于兼容性探测失败(' + e.message + ')，跳过探测，视为不支持');
+    return false;
+  }
+
+  const probeConfig = {
+    log: { disabled: true },
+    outbounds: [
+      { type: 'direct', tag: 'direct' },
+      {
+        type: 'wireguard',
+        tag: 'warp-probe',
+        server: 'engage.cloudflareclient.com',
+        server_port: 2408,
+        local_address: ['172.16.0.2/32'],
+        private_key: 'yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=',
+        peer_public_key: 'bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=',
+        reserved: [0, 0, 0],
+        mtu: 1280
+      }
+    ],
+    route: { final: 'direct' }
+  };
+
+  let rc;
+  const probeConfigPath = path.resolve(runtimeFilePath, '.wireguard-probe.json');
+  try {
+    // StartSingBox 期望的是 {config, workingDir, disableColor} 这层启动参数信封，
+    // 其中 config 必须是磁盘上配置文件的路径，而不是内联的配置内容本身
+    // （这与 singBoxPayload() 生产环境的调用约定完全一致，此前这里直接把
+    // probeConfig 序列化传入，被 .so 内部当成 CLI 参数解析，才误判成"不支持"）
+    fs.writeFileSync(probeConfigPath, JSON.stringify(probeConfig));
+    const probePayload = JSON.stringify({ config: probeConfigPath, workingDir: '.', disableColor: true });
+    rc = startFn(probePayload);
+  } catch (e) {
+    console.log('WARP: 兼容性探测调用异常(' + e.message + ')，判定为不支持 wireguard 出站');
+    try { stopFn(); } catch (e2) { /* ignore */ }
+    try { fs.unlinkSync(probeConfigPath); } catch (e3) { /* ignore */ }
+    return false;
+  }
+  try { stopFn(); } catch (e) { /* ignore */ }
+  try { fs.unlinkSync(probeConfigPath); } catch (e) { /* ignore */ }
+
+  const supported = rc === 0;
+  console.log(`WARP: 当前 sing-box 库(.so)兼容性探测 -> ${supported ? '通过，支持 wireguard 出站' : '未通过(返回码 ' + rc + ')，该版本不支持我们使用的 wireguard 出站写法'}`);
+  return supported;
+}
+
+// 启动时调用：先探测当前.so是否支持wireguard出站(不支持直接跳过，不浪费一次注册)；
+// 支持的话，本地有有效 warp.json 就直接复用；没有则注册一次并保存；注册失败则返回 null
+async function getOrCreateWarpIdentity(libraryPath, startSymbol, stopSymbol) {
+  const udpOk = await detectUdpEgress();
+  if (!udpOk) {
+    return null;
+  }
+
+  if (libraryPath) {
+    const supported = probeWireguardOutboundSupport(libraryPath, startSymbol, stopSymbol);
+    if (!supported) {
+      console.log('WARP: 因当前 sing-box 库不支持 wireguard 出站，已自动关闭 WARP，其余部分正常安装');
+      return null;
+    }
+  } else {
+    console.log('WARP: 未提供 .so 路径，跳过兼容性探测，直接尝试注册/复用身份');
+  }
+
+  let cfg = null;
+
+  try {
+    if (fs.existsSync(warpConfigPath)) {
+      const loaded = JSON.parse(fs.readFileSync(warpConfigPath, 'utf8'));
+      if (isValidWarpConfig(loaded)) {
+        console.log('WARP: 检测到本地 warp.json，复用已注册身份');
+        cfg = loaded;
+      } else {
+        console.log('WARP: 本地 warp.json 内容不完整，将重新注册');
+      }
+    }
+  } catch (e) {
+    console.log('WARP: 读取 warp.json 失败(' + e.message + ')，将重新注册');
+  }
+
+  if (!cfg) {
+    try {
+      console.log('WARP: 未找到可用身份，正在向 Cloudflare 注册新的 WARP 身份...');
+      cfg = await registerWarp();
+      fs.writeFileSync(warpConfigPath, JSON.stringify(cfg, null, 2));
+      console.log('WARP: 注册成功，已保存到 warp.json，后续将直接复用');
+    } catch (e) {
+      console.error('WARP: 注册失败(' + e.message + ')，本次运行将禁用 WARP，自动降级为纯 direct 出站');
+      return null;
+    }
+  }
+
+  try {
+    await diagnoseWarpEndpoint(cfg);
+  } catch (e) {
+    console.log('WARP: 端点探测过程出现异常(' + e.message + ')，跳过该项诊断，不影响WARP启用');
+  }
+
+  return cfg;
+}
+
 // ======================== Argo 隧道配置 ========================
 
 function argoType() {
@@ -247,15 +574,17 @@ function argoType() {
   if (ARGO_AUTH.includes('TunnelSecret')) {
     fs.writeFileSync(path.join(FILE_PATH, 'tunnel.json'), ARGO_AUTH);
     const tunnelYaml = `
-tunnel: ${ARGO_AUTH.split('"')[11]}
-credentials-file: ${path.join(FILE_PATH, 'tunnel.json')}
-protocol: http2
-
-ingress:
-  - hostname: ${ARGO_DOMAIN}
-    service: http://localhost:${ARGO_PORT}
-  - service: http_status:404
-`;
+  tunnel: ${ARGO_AUTH.split('"')[11]}
+  credentials-file: ${path.join(FILE_PATH, 'tunnel.json')}
+  protocol: http2
+  
+  ingress:
+    - hostname: ${ARGO_DOMAIN}
+      service: http://localhost:${ARGO_PORT}
+      originRequest:
+        noTLSVerify: true
+    - service: http_status:404
+  `;
     fs.writeFileSync(path.join(FILE_PATH, 'tunnel.yml'), tunnelYaml);
   } else {
     console.log(`Using token connect to tunnel, please set ${ARGO_PORT} in cloudflare`);
@@ -335,8 +664,13 @@ function createService(name, libraryPath, startSymbol, stopSymbol, payload) {
 
 // ======================== sing-box 配置生成 ========================
 
-function generateSingBoxConfig() {
-  const inbounds = [{
+const WARP_OUTBOUND_TAG = 'warp-auto';
+
+function generateSingBoxConfig(warpConfig) {
+  const inbounds = [];
+
+  // VLESS+WS inbound (for argo reverse proxy)
+  inbounds.push({
     type: 'vless',
     tag: 'vless-ws-in',
     listen: '::',
@@ -347,23 +681,117 @@ function generateSingBoxConfig() {
       path: '/vless-argo',
       early_data_header_name: 'Sec-WebSocket-Protocol'
     }
-  }];
+  });
 
-  const outbounds = [{
-    type: 'direct',
-    tag: 'direct'
-  }];
+  const outbounds = [{ type: 'direct', tag: 'direct' }];
+  const warpAvailable = isValidWarpConfig(warpConfig);
+
+  if (warpAvailable) {
+    // 使用注册得到的真实WARP身份（而非写死的密钥）
+    // 注意：这里用的是 sing-box 的“旧式” outbound wireguard 写法（server/server_port/local_address/
+    // private_key/peer_public_key/reserved 直接放在 outbounds[] 里），而不是 1.11+ 才支持的 endpoints[]
+    // 写法。community 里常见的 vless+argo+warp 一键脚本大多也是这种写法，兼容性更好——
+    // 因为这里跑的 sing-box 是通过 koffi 加载的固定版本 .so 库文件，具体核心版本未知，
+    // 如果它早于 1.11，endpoints[] 这个字段根本不认识，会被直接忽略，表现就是“节点能通但WARP没生效”。
+    // 旧式 outbound 写法从 sing-box 出现 wireguard 支持起就一直可用，直到 1.13 才会被移除，兼容区间更宽。
+    const localAddress = [`${warpConfig.address_v4}/32`];
+    if (warpConfig.address_v6) localAddress.push(`${warpConfig.address_v6}/128`);
+
+    outbounds.push({
+      type: 'wireguard',
+      tag: 'wireguard-out',
+      server: warpConfig.endpoint_host,
+      server_port: warpConfig.endpoint_port,
+      local_address: localAddress,
+      private_key: warpConfig.private_key,
+      peer_public_key: warpConfig.public_key,
+      reserved: warpConfig.reserved,
+      mtu: 1280
+    });
+
+    outbounds.push({
+      type: 'urltest',
+      tag: WARP_OUTBOUND_TAG,
+      outbounds: ['wireguard-out', 'direct'],
+      url: 'https://www.gstatic.com/generate_204',
+      interval: '2m',
+      tolerance: 100
+    });
+  } else {
+    console.log('WARP身份不可用，跳过wireguard出站配置，所有分流规则自动禁用，出站全部走direct');
+  }
+
+  const remoteRuleSet = (tag, url) => ({
+    tag,
+    type: 'remote',
+    format: 'binary',
+    url
+  });
+
+  let route;
+
+  if (GLOBAL_WARP === true || GLOBAL_WARP === 'true') {
+    if (warpAvailable) {
+      // 全局WARP：所有出站流量默认走warpOutboundTag（内部会自动探测WARP是否可用，不可用则回落到direct）
+      console.log('GLOBAL_WARP已启用，所有出站流量将默认走WARP（带自动故障转移）');
+      route = {
+        default_http_client: 'http-client-direct',
+        final: WARP_OUTBOUND_TAG
+      };
+    } else {
+      console.log('GLOBAL_WARP已启用，但WARP身份不可用，自动降级为全部direct出站');
+      route = {
+        default_http_client: 'http-client-direct',
+        final: 'direct'
+      };
+    }
+  } else if (!warpAvailable) {
+    // 无可用WARP身份：不生成任何分流规则，全部走direct
+    route = {
+      default_http_client: 'http-client-direct',
+      final: 'direct'
+    };
+  } else {
+    const ruleSet = [
+      remoteRuleSet('netflix', 'https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/netflix.srs')
+    ];
+    const wireguardRuleSets = ['netflix'];
+
+    // YouTube WARP 出站检测
+    let needYoutubeWarp = YT_WARPOUT === true || YT_WARPOUT === 'true';
+    if (!needYoutubeWarp) {
+      try {
+        const youtubeTest = execSync('curl -o /dev/null -m 2 -s -w "%{http_code}" https://www.youtube.com', { encoding: 'utf8' }).trim();
+        needYoutubeWarp = youtubeTest !== '200';
+      } catch (curlError) {
+        if (curlError.output && curlError.output[1]) {
+          const test = curlError.output[1].toString().trim();
+          needYoutubeWarp = test !== '200';
+        } else {
+          needYoutubeWarp = true;
+        }
+      }
+    }
+    if (needYoutubeWarp) {
+      ruleSet.push(remoteRuleSet('youtube', 'https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/youtube.srs'));
+      wireguardRuleSets.push('youtube');
+      console.log('Add YouTube outbound rule');
+    }
+
+    route = {
+      default_http_client: 'http-client-direct',
+      rule_set: ruleSet,
+      rules: [{ rule_set: wireguardRuleSets, outbound: WARP_OUTBOUND_TAG }],
+      final: 'direct'
+    };
+  }
 
   return {
-    log: { 
-      disabled: true, 
-      level: 'error' 
-    },
+    log: { disabled: true, level: 'error', timestamp: true },
+    http_clients: [{ tag: 'http-client-direct' }],
     inbounds,
     outbounds,
-    route: {
-      final: 'direct'
-    }
+    route
   };
 }
 
@@ -553,11 +981,21 @@ async function startServer() {
     cloudflaredLib = await downloadLibrary(`${baseUrl}/freebsd-bot.so`, 'bot.so');
   }
 
-  // 4. 生成 sing-box config.json
-  const sbxConfig = generateSingBoxConfig();
+  // 4. 获取/注册 WARP 身份（先用当前.so实测是否支持wireguard出站；本地已有 warp.json 则直接复用；
+  //    注册失败或不支持都优雅降级，不阻塞服务启动）
+  let warpConfig = null;
+  try {
+    warpConfig = await getOrCreateWarpIdentity(singBoxLib, 'StartSingBox', 'StopSingBox');
+  } catch (e) {
+    console.error('WARP: 获取身份过程出现未捕获异常，禁用WARP并继续启动:', e.message);
+    warpConfig = null;
+  }
+
+  // 5. 生成 sing-box config.json
+  const sbxConfig = generateSingBoxConfig(warpConfig);
   fs.writeFileSync(singBoxConfigPath, JSON.stringify(sbxConfig, null, 2));
 
-  // 5. 启动服务
+  // 6. 启动服务
   const services = [];
 
   // sing-box
@@ -589,14 +1027,14 @@ async function startServer() {
   console.log('web is running');
   if (cloudflaredService) console.log('bot is running');
 
-  // 6. 等待并检测隧道域名
+  // 7. 等待并检测隧道域名
   await new Promise(r => setTimeout(r, 5000));
   const argoDomain = await extractDomain();
 
-  // 7. 生成节点链接
+  // 8. 生成节点链接
   const subTxt = await generateLinks(argoDomain);
 
-  // 8. 启动 HTTP 服务器
+  // 9. 启动 HTTP 服务器
   startHttpServer(subTxt);
 
   setTimeout(() => {
@@ -617,7 +1055,9 @@ install_service () {
     rm -rf $HOME/domains/${USERNAME}.${CURRENT_DOMAIN} > /dev/null 2>&1
     devil www add ${USERNAME}.${CURRENT_DOMAIN} nodejs /usr/local/bin/node24 > /dev/null 2>&1
     [ -d "$WORKDIR" ] || mkdir -p "$WORKDIR"
-    # Passenger 对静态文件优先级高，必须清空默认 index.html 拦截
+    # devil 在 add 时会自动在 public/ 下放一个默认占位 index.html；
+    # Passenger 对该目录下的静态文件优先级高于应用本身，不清掉的话根路径请求
+    # 永远会被这个占位页拦截，走不到 Node app.js
     rm -f "${WORKDIR}/public/index.html" > /dev/null 2>&1
     write_app_js "${WORKDIR}/app.js"
     cat > "${WORKDIR}/index.html" <<'HTMLEOF'
@@ -937,6 +1377,7 @@ SUB_PATH=${SUB_PATH}
 ARGO_PORT=${ARGO_PORT}
 ${ARGO_DOMAIN:+ARGO_DOMAIN=$ARGO_DOMAIN}
 ${ARGO_AUTH:+ARGO_AUTH=$([[ -z "$ARGO_AUTH" ]] && echo "" || ([[ "$ARGO_AUTH" =~ ^\{.* ]] && echo "'$ARGO_AUTH'" || echo "$ARGO_AUTH"))}
+${GLOBAL_WARP:+GLOBAL_WARP=$GLOBAL_WARP}
 EOF
 
   ln -fs /usr/local/bin/node24 ~/bin/node > /dev/null 2>&1
@@ -967,7 +1408,7 @@ quick_command() {
   mkdir -p "$HOME/bin"
   set +H
   printf '#!/bin/bash\n' > "$SCRIPT_PATH"
-  echo "bash <(curl -Ls https://raw.githubusercontent.com/Joshuagpt/Vless_Argo_Reality/main/servct.sh)" >> "$SCRIPT_PATH"
+  echo "bash <(curl -Ls https://raw.githubusercontent.com/eooce/sing-box/main/sb_serv00.sh)" >> "$SCRIPT_PATH"
   chmod +x "$SCRIPT_PATH"
   if [[ ":$PATH:" != *":$HOME/bin:"* ]]; then
       echo 'export PATH="$HOME/bin:$PATH"' >> "$HOME/.bashrc" 2>/dev/null
