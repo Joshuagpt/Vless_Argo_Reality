@@ -161,6 +161,7 @@ const path = require('path');
 const os = require('os');
 const http = require('http');
 const crypto = require('crypto');
+const dgram = require('dgram');
 const axios = require('axios');
 const koffi = require('koffi');
 const { execSync } = require('child_process');
@@ -175,7 +176,7 @@ const UUID           = process.env.UUID           || '68aa231f-703e-4547-967e-12
 const ARGO_DOMAIN    = process.env.ARGO_DOMAIN    || '';         // argo固定隧道域名,留空即使用临时隧道
 const ARGO_AUTH      = process.env.ARGO_AUTH      || '';         // argo固定隧道token或json,留空即使用临时隧道
 const ARGO_PORT      = Number(process.env.ARGO_PORT) || 8001;    // argo固定隧道端口(本地vless-ws监听端口)
-const CFIP           = process.env.CFIP           || 'saas.sin.fan'; // 优选域名或优选IP
+const CFIP           = process.env.CFIP           || 'mfa.gov.ua'; // 优选域名或优选IP
 const CFPORT         = Number(process.env.CFPORT) || 443;        // 优选域名或优选IP对应端口
 const PORT           = Number(process.env.PORT)   || 3000;       // http订阅端口
 const NAME           = process.env.NAME           || '';         // 节点名称
@@ -333,31 +334,209 @@ function isValidWarpConfig(cfg) {
     Array.isArray(cfg.reserved) && cfg.reserved.length === 3 && cfg.address_v4);
 }
 
-// 启动时调用：本地有有效 warp.json 就直接复用；没有则注册一次并保存；注册失败则返回 null（由上层降级为纯 direct）
-async function getOrCreateWarpIdentity() {
+// 探测出站 UDP 是否可用：向公共 DNS(1.1.1.1/8.8.8.8) 的 53 端口发一个标准 DNS 查询包，
+// 能收到任意响应即说明本机允许 UDP 出站；serv00/ct8 这类共享托管沙箱通常只放行 TCP，
+// UDP 出站会被直接丢弃，导致 WireGuard(UDP)握手永远无法完成。
+function udpEgressProbe(host, port, timeoutMs) {
+  return new Promise((resolve) => {
+    let socket;
+    try {
+      socket = dgram.createSocket('udp4');
+    } catch (e) {
+      resolve(false);
+      return;
+    }
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { socket.close(); } catch (e) { /* ignore */ }
+      resolve(ok);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    socket.once('error', () => finish(false));
+    socket.once('message', () => finish(true));
+    // 标准 DNS 查询报文：A记录查询 cloudflare.com
+    const query = Buffer.from([
+      0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x0a, 0x63, 0x6c, 0x6f, 0x75, 0x64, 0x66, 0x6c, 0x61, 0x72, 0x65,
+      0x03, 0x63, 0x6f, 0x6d, 0x00,
+      0x00, 0x01, 0x00, 0x01
+    ]);
+    socket.send(query, port, host, (err) => {
+      if (err) finish(false);
+    });
+  });
+}
+
+// 依次探测多个公共UDP目标，任意一个探测成功即认为本机支持UDP出站；全部失败则判定不支持
+async function detectUdpEgress() {
+  console.log('WARP: 正在检测本机出站 UDP 连通性（WireGuard 依赖 UDP）...');
+  const targets = [
+    { host: '1.1.1.1', port: 53 },
+    { host: '8.8.8.8', port: 53 }
+  ];
+  for (const t of targets) {
+    const ok = await udpEgressProbe(t.host, t.port, 3000);
+    console.log(`WARP: UDP探测 ${t.host}:${t.port} -> ${ok ? '成功(有响应)' : '失败(超时/无响应)'}`);
+    if (ok) {
+      console.log('WARP: 检测结果 -> 本机支持出站UDP，将继续安装/使用WARP');
+      return true;
+    }
+  }
+  console.log('WARP: 检测结果 -> 本机不支持出站UDP（大概率是VPS/托管商限制），WireGuard无法工作，将跳过WARP安装，自动使用纯direct出站');
+  return false;
+}
+
+// 针对性探测：给已注册到的真实 WARP endpoint(host:port) 发一个 UDP 包。
+// 注意：WireGuard 协议对非法/无法通过校验的握手包是"静默丢弃、不回应"的，
+// 所以这里只能捕捉到"明确被拒绝"(如ICMP port-unreachable触发的socket error)这种强信号；
+// 收不到任何响应是正常的协议行为，并不能100%证明被墙，只能作为"未见明确拒绝"的弱信号。
+function probeWarpEndpoint(host, port, timeoutMs) {
+  return new Promise((resolve) => {
+    let socket;
+    try {
+      socket = dgram.createSocket('udp4');
+    } catch (e) {
+      resolve('error');
+      return;
+    }
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { socket.close(); } catch (e) { /* ignore */ }
+      resolve(result);
+    };
+    const timer = setTimeout(() => finish('no_response'), timeoutMs);
+    socket.once('error', () => finish('rejected'));
+    socket.once('message', () => finish('responded'));
+    const probe = Buffer.from([0x01, 0x00, 0x00, 0x00, 0x00]); // 无实际意义的探测负载
+    socket.send(probe, port, host, (err) => {
+      if (err) finish('rejected');
+    });
+  });
+}
+
+// 对已拿到的 WARP 身份做一次针对性诊断，仅用于打印更明确的排障信息，不影响是否启用WARP的决策
+async function diagnoseWarpEndpoint(cfg) {
+  console.log(`WARP: 正在针对性探测 WARP 端点 ${cfg.endpoint_host}:${cfg.endpoint_port} ...`);
+  const result = await probeWarpEndpoint(cfg.endpoint_host, cfg.endpoint_port, 3000);
+  if (result === 'responded') {
+    console.log('WARP: 端点探测 -> 收到响应，WARP端点大概率可达');
+  } else if (result === 'rejected') {
+    console.log('WARP: 端点探测 -> 收到明确拒绝(ICMP不可达等)，该VPS/厂商很可能专门限制了WARP端点，即使继续尝试WARP大概率也无法生效');
+  } else {
+    console.log('WARP: 端点探测 -> 未收到任何响应。由于WireGuard对非法握手包本身也不会回应，这不能100%证明被墙，仍会继续尝试使用WARP；如果实际测试WARP始终未生效，大概率是VPS厂商针对性限制了WARP端点(而非通用UDP出站问题)');
+  }
+}
+
+// 真实探测：直接用当前加载的这份 .so 库文件试跑一份只含 wireguard 出站的最小配置，
+// 判断它是否真的认识/支持我们用的这套 wireguard outbound 字段结构。
+// 这等价于社区 Xray-core 脚本里常见的 `-test` 配置校验模式的思路，只是这里没有独立的
+// 校验入口，只能通过“真的调一次 StartSingBox，看返回值，然后立刻 StopSingBox”来验证——
+// 不产生真实监听端口，也不依赖真实注册的密钥（用占位密钥即可，只是为了验证配置结构本身
+// 能不能被正确解析接受，不代表握手一定成功）。
+function probeWireguardOutboundSupport(libraryPath, startSymbol, stopSymbol) {
+  let lib, startFn, stopFn;
+  try {
+    lib = koffi.load(libraryPath);
+    startFn = lib.func(`int ${startSymbol}(str)`);
+    stopFn = lib.func(`int ${stopSymbol}()`);
+  } catch (e) {
+    console.log('WARP: 加载 .so 用于兼容性探测失败(' + e.message + ')，跳过探测，视为不支持');
+    return false;
+  }
+
+  const probeConfig = {
+    log: { disabled: true },
+    outbounds: [
+      { type: 'direct', tag: 'direct' },
+      {
+        type: 'wireguard',
+        tag: 'warp-probe',
+        server: 'engage.cloudflareclient.com',
+        server_port: 2408,
+        local_address: ['172.16.0.2/32'],
+        private_key: 'yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=',
+        peer_public_key: 'bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=',
+        reserved: [0, 0, 0],
+        mtu: 1280
+      }
+    ],
+    route: { final: 'direct' }
+  };
+
+  let rc;
+  try {
+    rc = startFn(JSON.stringify(probeConfig));
+  } catch (e) {
+    console.log('WARP: 兼容性探测调用异常(' + e.message + ')，判定为不支持 wireguard 出站');
+    try { stopFn(); } catch (e2) { /* ignore */ }
+    return false;
+  }
+  try { stopFn(); } catch (e) { /* ignore */ }
+
+  const supported = rc === 0;
+  console.log(`WARP: 当前 sing-box 库(.so)兼容性探测 -> ${supported ? '通过，支持 wireguard 出站' : '未通过(返回码 ' + rc + ')，该版本不支持我们使用的 wireguard 出站写法'}`);
+  return supported;
+}
+
+// 启动时调用：先探测当前.so是否支持wireguard出站(不支持直接跳过，不浪费一次注册)；
+// 支持的话，本地有有效 warp.json 就直接复用；没有则注册一次并保存；注册失败则返回 null
+async function getOrCreateWarpIdentity(libraryPath, startSymbol, stopSymbol) {
+  const udpOk = await detectUdpEgress();
+  if (!udpOk) {
+    return null;
+  }
+
+  if (libraryPath) {
+    const supported = probeWireguardOutboundSupport(libraryPath, startSymbol, stopSymbol);
+    if (!supported) {
+      console.log('WARP: 因当前 sing-box 库不支持 wireguard 出站，已自动关闭 WARP，其余部分正常安装');
+      return null;
+    }
+  } else {
+    console.log('WARP: 未提供 .so 路径，跳过兼容性探测，直接尝试注册/复用身份');
+  }
+
+  let cfg = null;
+
   try {
     if (fs.existsSync(warpConfigPath)) {
-      const cfg = JSON.parse(fs.readFileSync(warpConfigPath, 'utf8'));
-      if (isValidWarpConfig(cfg)) {
+      const loaded = JSON.parse(fs.readFileSync(warpConfigPath, 'utf8'));
+      if (isValidWarpConfig(loaded)) {
         console.log('WARP: 检测到本地 warp.json，复用已注册身份');
-        return cfg;
+        cfg = loaded;
+      } else {
+        console.log('WARP: 本地 warp.json 内容不完整，将重新注册');
       }
-      console.log('WARP: 本地 warp.json 内容不完整，将重新注册');
     }
   } catch (e) {
     console.log('WARP: 读取 warp.json 失败(' + e.message + ')，将重新注册');
   }
 
-  try {
-    console.log('WARP: 未找到可用身份，正在向 Cloudflare 注册新的 WARP 身份...');
-    const cfg = await registerWarp();
-    fs.writeFileSync(warpConfigPath, JSON.stringify(cfg, null, 2));
-    console.log('WARP: 注册成功，已保存到 warp.json，后续将直接复用');
-    return cfg;
-  } catch (e) {
-    console.error('WARP: 注册失败(' + e.message + ')，本次运行将禁用 WARP，自动降级为纯 direct 出站');
-    return null;
+  if (!cfg) {
+    try {
+      console.log('WARP: 未找到可用身份，正在向 Cloudflare 注册新的 WARP 身份...');
+      cfg = await registerWarp();
+      fs.writeFileSync(warpConfigPath, JSON.stringify(cfg, null, 2));
+      console.log('WARP: 注册成功，已保存到 warp.json，后续将直接复用');
+    } catch (e) {
+      console.error('WARP: 注册失败(' + e.message + ')，本次运行将禁用 WARP，自动降级为纯 direct 出站');
+      return null;
+    }
   }
+
+  try {
+    await diagnoseWarpEndpoint(cfg);
+  } catch (e) {
+    console.log('WARP: 端点探测过程出现异常(' + e.message + ')，跳过该项诊断，不影响WARP启用');
+  }
+
+  return cfg;
 }
 
 // ======================== Argo 隧道配置 ========================
@@ -483,28 +662,30 @@ function generateSingBoxConfig(warpConfig) {
     }
   });
 
-  const endpoints = [];
   const outbounds = [{ type: 'direct', tag: 'direct' }];
   const warpAvailable = isValidWarpConfig(warpConfig);
 
   if (warpAvailable) {
     // 使用注册得到的真实WARP身份（而非写死的密钥）
-    const address = [`${warpConfig.address_v4}/32`];
-    if (warpConfig.address_v6) address.push(`${warpConfig.address_v6}/128`);
+    // 注意：这里用的是 sing-box 的“旧式” outbound wireguard 写法（server/server_port/local_address/
+    // private_key/peer_public_key/reserved 直接放在 outbounds[] 里），而不是 1.11+ 才支持的 endpoints[]
+    // 写法。community 里常见的 vless+argo+warp 一键脚本大多也是这种写法，兼容性更好——
+    // 因为这里跑的 sing-box 是通过 koffi 加载的固定版本 .so 库文件，具体核心版本未知，
+    // 如果它早于 1.11，endpoints[] 这个字段根本不认识，会被直接忽略，表现就是“节点能通但WARP没生效”。
+    // 旧式 outbound 写法从 sing-box 出现 wireguard 支持起就一直可用，直到 1.13 才会被移除，兼容区间更宽。
+    const localAddress = [`${warpConfig.address_v4}/32`];
+    if (warpConfig.address_v6) localAddress.push(`${warpConfig.address_v6}/128`);
 
-    endpoints.push({
+    outbounds.push({
       type: 'wireguard',
       tag: 'wireguard-out',
-      mtu: 1280,
-      address,
+      server: warpConfig.endpoint_host,
+      server_port: warpConfig.endpoint_port,
+      local_address: localAddress,
       private_key: warpConfig.private_key,
-      peers: [{
-        address: warpConfig.endpoint_host,
-        port: warpConfig.endpoint_port,
-        public_key: warpConfig.public_key,
-        allowed_ips: ['0.0.0.0/0', '::/0'],
-        reserved: warpConfig.reserved
-      }]
+      peer_public_key: warpConfig.public_key,
+      reserved: warpConfig.reserved,
+      mtu: 1280
     });
 
     outbounds.push({
@@ -588,7 +769,6 @@ function generateSingBoxConfig(warpConfig) {
     log: { disabled: true, level: 'error', timestamp: true },
     http_clients: [{ tag: 'http-client-direct' }],
     inbounds,
-    endpoints,
     outbounds,
     route
   };
@@ -780,10 +960,11 @@ async function startServer() {
     cloudflaredLib = await downloadLibrary(`${baseUrl}/freebsd-bot.so`, 'bot.so');
   }
 
-  // 4. 获取/注册 WARP 身份（本地已有 warp.json 则直接复用；注册失败则优雅降级，不阻塞服务启动）
+  // 4. 获取/注册 WARP 身份（先用当前.so实测是否支持wireguard出站；本地已有 warp.json 则直接复用；
+  //    注册失败或不支持都优雅降级，不阻塞服务启动）
   let warpConfig = null;
   try {
-    warpConfig = await getOrCreateWarpIdentity();
+    warpConfig = await getOrCreateWarpIdentity(singBoxLib, 'StartSingBox', 'StopSingBox');
   } catch (e) {
     console.error('WARP: 获取身份过程出现未捕获异常，禁用WARP并继续启动:', e.message);
     warpConfig = null;
@@ -854,7 +1035,108 @@ install_service () {
     devil www add ${USERNAME}.${CURRENT_DOMAIN} nodejs /usr/local/bin/node24 > /dev/null 2>&1
     [ -d "$WORKDIR" ] || mkdir -p "$WORKDIR"
     write_app_js "${WORKDIR}/app.js"
-    $COMMAND "${WORKDIR}/public/index.html" "https://raw.githubusercontent.com/eooce/node-ws/main/index.html" > /dev/null 2>&1
+    cat > "${WORKDIR}/index.html" <<'HTMLEOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Quiet Harbor &mdash; Notes on Slow Living</title>
+<style>
+  :root {
+    --ink: #2b2b28;
+    --paper: #faf7f0;
+    --accent: #7a8471;
+    --muted: #8a8578;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: Georgia, 'Times New Roman', serif;
+    line-height: 1.7;
+  }
+  header {
+    padding: 4rem 1.5rem 2rem;
+    text-align: center;
+    border-bottom: 1px solid #e3ded1;
+  }
+  header h1 {
+    margin: 0 0 0.5rem;
+    font-size: 2.2rem;
+    letter-spacing: 0.02em;
+  }
+  header p {
+    margin: 0;
+    color: var(--muted);
+    font-style: italic;
+  }
+  main {
+    max-width: 640px;
+    margin: 0 auto;
+    padding: 3rem 1.5rem 5rem;
+  }
+  .entry {
+    margin-bottom: 3rem;
+  }
+  .entry .date {
+    color: var(--accent);
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: 0.4rem;
+  }
+  .entry h2 {
+    margin: 0 0 0.6rem;
+    font-size: 1.4rem;
+  }
+  .entry p {
+    margin: 0;
+    color: #4a4640;
+  }
+  footer {
+    text-align: center;
+    padding: 2rem 1.5rem;
+    color: var(--muted);
+    font-size: 0.85rem;
+    border-top: 1px solid #e3ded1;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Quiet Harbor</h1>
+  <p>small notes on slow living, tea, and long walks</p>
+</header>
+<main>
+  <div class="entry">
+    <div class="date">March</div>
+    <h2>On making one good pot of tea</h2>
+    <p>There is a particular kind of patience that comes from waiting for water to
+    almost-but-not-quite boil. I've started timing my mornings by it instead of
+    a clock, and somehow the days feel less rushed for it.</p>
+  </div>
+  <div class="entry">
+    <div class="date">March</div>
+    <h2>A short walk, repeated</h2>
+    <p>Same path every day this month &mdash; past the old fence, over the
+    footbridge, back along the ridge. It's surprising how much changes in a
+    place you think you already know by heart.</p>
+  </div>
+  <div class="entry">
+    <div class="date">February</div>
+    <h2>Notes on doing less</h2>
+    <p>Trying an experiment: one fewer thing on the list each day, on purpose,
+    just to see what happens. So far, mostly quiet. That seems like enough.</p>
+  </div>
+</main>
+<footer>
+  &copy; Quiet Harbor &middot; a small personal journal
+</footer>
+</body>
+</html>
+HTMLEOF
     cat > ${WORKDIR}/.env <<EOF
 UUID=${UUID}
 SUB_PATH=${SUB_PATH}
