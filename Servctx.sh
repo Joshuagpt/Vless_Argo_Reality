@@ -226,7 +226,7 @@ remove_keepalive_cron() {
 
 write_app_js() {
   cat > "$1" <<'JSEOF'
-#!/usr/bin/env node
+#!/usr/bin/env -S node --max-old-space-size=64
 
 const fs = require('fs');
 const path = require('path');
@@ -256,6 +256,16 @@ const GLOBAL_WARP    = String(process.env.GLOBAL_WARP).toLowerCase() === 'true';
 const TG_BOT_TOKEN    = process.env.TG_BOT_TOKEN    || '';        // Telegram Bot Token,留空则不发送告警
 const TG_CHAT_ID      = process.env.TG_CHAT_ID      || '';        // Telegram Chat ID,留空则不发送告警
 // ==============================================================
+
+// engine(子进程)和 cloudflared(koffi 进程内加载)底层都是 Go 运行时。
+// 之前只用 GOMEMLIMIT 是为了避免 GOGC 太低导致 GC 过于频繁、CPU 抖动；
+// 既然实测 CPU 占用几乎为 0，有富余，这里改成 GOGC + GOMEMLIMIT 一起用，
+// 用更多的 GC 次数换更低的内存占用是划算的。数值比之前更紧一档。
+// 下面这组默认值通过进程环境inherit给 cloudflared(与 Node 同进程，dlopen 时能读到)；
+// engine 是独立子进程，在 startEngine() 里单独给了自己的 GOMEMLIMIT(它是实际转发数据的
+// 一方，稍微多留一点余量)，GOGC 则沿用下面这份全局默认，两者内存额度互不共享。
+process.env.GOGC = process.env.GOGC || '40';
+process.env.GOMEMLIMIT = process.env.GOMEMLIMIT || '48MiB';
 
 const ROOT = process.cwd();
 const runtimeFilePath = path.resolve(ROOT, FILE_PATH);
@@ -754,7 +764,10 @@ function startEngine(engineBinPath, configPath) {
     const startedAt = Date.now();
     const child = spawn(engineBinPath, ['run', '-c', configPath], {
       cwd: runtimeFilePath,
-      stdio: ['ignore', 'pipe', 'pipe']
+      stdio: ['ignore', 'pipe', 'pipe'],
+      // engine 独立进程，单独给宽松一点的软内存上限(默认64MiB)，不与 cloudflared 共用48MiB那份；
+      // GOGC 沿用上面注入到 process.env 的全局默认值(通过 ...process.env 带过来)
+      env: { ...process.env, GOMEMLIMIT: process.env.ENGINE_GOMEMLIMIT || '64MiB' }
     });
 
     child.stdout.on('data', d => process.stdout.write(`[engine] ${d}`));
