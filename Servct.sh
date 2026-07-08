@@ -431,19 +431,6 @@ if len(sys.argv) < 2:
 so_path = sys.argv[1]
 tunnel_args = sys.argv[2:]
 
-# --------------------------------------------------------------
-# Go runtime 内存/线程优化: 必须在 dlopen(.so) 之前设置,因为 Go 的
-# GOMAXPROCS/GOGC/GOMEMLIMIT 都是包初始化阶段读取的环境变量。
-# serv00/ct8 这类共享主机上 runtime.NumCPU() 探测到的往往是宿主机
-# 的总核数(可能几十核),而不是实际配额,会导致 Go 按核数开一大堆
-# 调度线程(P)/GC worker,内存和线程数都明显偏高。这里显式收紧:
-# - GOMAXPROCS=1: 隧道场景以网络I/O为主,不吃多核,收紧后线程数大降
-# - GOGC=50 + GOMEMLIMIT: 让GC更积极地把内存还给系统,以换取用CPU换内存
-# 如需调整阈值,按实际内存配额改 GOMEMLIMIT 即可。
-os.environ.setdefault("GOMAXPROCS", "1")
-os.environ.setdefault("GOGC", "50")
-os.environ.setdefault("GOMEMLIMIT", "48MiB")
-
 lib = ctypes.CDLL(so_path)
 lib.StartCloudflared.argtypes = [ctypes.c_char_p]
 lib.StartCloudflared.restype = ctypes.c_int
@@ -679,9 +666,6 @@ generate_config
 # ---------------------------------------------------------------
 start_services() {
   cd "$BIN_DIR" || exit 1
-  # core(xray) 同样收紧 GOMAXPROCS: 共享主机上 runtime.NumCPU() 探测到的常是
-  # 宿主机总核数而非实际配额,不收紧会导致调度线程数虚高,内存跟着偏高
-  export GOMAXPROCS=1 GOGC=50 GOMEMLIMIT=48MiB
   nohup ./core -c config.json >/dev/null 2>&1 &
   echo $! > "${BIN_DIR}/core.pid"
   sleep 2
@@ -713,32 +697,6 @@ start_services() {
       echo $! > "${BIN_DIR}/sync.pid"
       sleep 2
   fi
-
-  # ---------------------------------------------------------------
-  # StartCloudflared 是"发射后不管"型调用: 进程活着不代表隧道已经真正跟
-  # Cloudflare Edge 建好连接、路由已生效。这里主动探测直到拿到真实HTTP
-  # 响应再宣布部署完成,避免"脚本说完成了但节点还没通"的等待期落差。
-  # 只有 token/tunnelsecret 模式此时已知道最终域名,quick tunnel 模式域名
-  # 要等 get_current_domain() 从 boot.log 里解析出来,放到那之后再等更合适。
-  # ---------------------------------------------------------------
-  if [ -n "$RELAY_AUTH" ] && [ -n "$RELAY_DOMAIN" ]; then
-      purple "等待隧道与 Cloudflare Edge 建立连接..."
-      local ready=0 n
-      for ((n=0; n<20; n++)); do
-          code=$(curl -sk -o /dev/null -m 3 -w "%{http_code}" "https://${RELAY_DOMAIN}" 2>/dev/null)
-          if [[ "$code" =~ ^(200|101|404|502|530)$ ]]; then
-              ready=1
-              break
-          fi
-          sleep 1
-      done
-      if [ "$ready" = 1 ]; then
-          green "隧道已连通(HTTP ${code})"
-      else
-          yellow "隧道连通性探测超时(${n}秒),节点可能仍在生效中,如暂时无法访问请稍后重试或检查 cf_debug.log"
-      fi
-  fi
-
   save_state
 }
 step "启动服务"
@@ -844,7 +802,7 @@ is_alive_sync() {
 }
 restart_core() {
     [ -f "${BIN_DIR}/core.pid" ] && kill -9 "$(cat "${BIN_DIR}/core.pid" 2>/dev/null)" >/dev/null 2>&1
-    ( cd "$BIN_DIR" && export GOMAXPROCS=1 GOGC=50 GOMEMLIMIT=48MiB && nohup ./core -c config.json >/dev/null 2>&1 & echo $! > "${BIN_DIR}/core.pid" )
+    ( cd "$BIN_DIR" && nohup ./core -c config.json >/dev/null 2>&1 & echo $! > "${BIN_DIR}/core.pid" )
     sleep 3
     is_alive_core
 }
