@@ -116,6 +116,7 @@ fi
 WORKDIR="${HOME}/domains/${USERNAME}.${CURRENT_DOMAIN}/logs"
 FILE_PATH="${HOME}/domains/${USERNAME}.${CURRENT_DOMAIN}/public_html"
 BIN_DIR="${HOME}/.px_bin"
+mkdir -p "$BIN_DIR"
 STATE_FILE="${BIN_DIR}/.px.env"
 
 # ---------------------------------------------------------------
