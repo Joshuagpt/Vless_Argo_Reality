@@ -396,16 +396,27 @@ download_binaries() {
   else
       purple "正在下载 cloudflared (FreeBSD ${CF_ARCH}.pkg)..."
       fetch_with_retry "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-${CF_ARCH}.pkg" "${BIN_DIR}/.sync.pkg" || exit 1
-      # .pkg 本质是 tar 归档,不是可直接执行的二进制,这里解包后取出真正的可执行文件
+
       mkdir -p "${BIN_DIR}/.sync_extract"
-      tar -xf "${BIN_DIR}/.sync.pkg" -C "${BIN_DIR}/.sync_extract" 2>/dev/null
-      SYNC_EXTRACTED=$(find "${BIN_DIR}/.sync_extract" -type f -name cloudflared | head -n1)
+      # 新版 FreeBSD pkg 默认是 zstd 压缩(.tzst 本质),部分老版本 tar 不认识 zstd 会解包失败/不完整。
+      # 优先尝试原生 tar;失败或者没解出东西时,再尝试显式加 --zstd,两种都失败才报错退出。
+      if ! tar -xf "${BIN_DIR}/.sync.pkg" -C "${BIN_DIR}/.sync_extract" 2>"${BIN_DIR}/.sync_extract_err.log"; then
+          yellow "默认 tar 解包失败,尝试以 zstd 方式重新解包..."
+          tar --zstd -xf "${BIN_DIR}/.sync.pkg" -C "${BIN_DIR}/.sync_extract" 2>>"${BIN_DIR}/.sync_extract_err.log"
+      fi
+
+      # 放宽匹配: 不要求文件名必须一字不差是 cloudflared,只要文件名包含 cloudflared 且有执行权限/体积不小(排除脚本类文件)都纳入候选
+      SYNC_EXTRACTED=$(find "${BIN_DIR}/.sync_extract" -type f -iname '*cloudflared*' ! -iname '*.txt' ! -iname '*manifest*' | head -n1)
+
       if [ -z "$SYNC_EXTRACTED" ]; then
-          red "未能从 cloudflared .pkg 包中解出可执行文件,请手动检查 ${BIN_DIR}/.sync_extract 目录结构"
+          red "未能从 cloudflared .pkg 包中解出可执行文件,包内实际结构如下(可反馈这段输出方便排查):"
+          tar -tf "${BIN_DIR}/.sync.pkg" 2>/dev/null | head -30
+          echo "-------- tar 解包报错信息 --------"
+          cat "${BIN_DIR}/.sync_extract_err.log" 2>/dev/null
           exit 1
       fi
       mv "$SYNC_EXTRACTED" "${BIN_DIR}/sync"
-      rm -rf "${BIN_DIR}/.sync.pkg" "${BIN_DIR}/.sync_extract"
+      rm -rf "${BIN_DIR}/.sync.pkg" "${BIN_DIR}/.sync_extract" "${BIN_DIR}/.sync_extract_err.log"
       chmod +x "${BIN_DIR}/sync"
   fi
   CORE_BIN="${BIN_DIR}/core"
@@ -920,35 +931,119 @@ generate_links() {
   install_keepalive
 }
 # ---------------------------------------------------------------
-# 主页伪装: 给根路径放一个普通静态页面,避免直接访问域名时是空白页/报错/
-# 明显的订阅文件列表。纯展示内容,不含任何代理相关信息。
+# 主页伪装：德语个人博客
 # ---------------------------------------------------------------
 install_decoy_homepage() {
-    [ -f "${FILE_PATH}/index.html" ] && return   # 已存在(比如用户自己放过内容)就不覆盖
+    [ -f "${FILE_PATH}/index.html" ] && return
     cat > "${FILE_PATH}/index.html" <<'HOMEEOF'
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="de">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>个人笔记</title>
+<title>Gedanken & Notizen</title>
 <style>
-  body { font-family: -apple-system, "Segoe UI", Arial, sans-serif; max-width: 640px;
-         margin: 8vh auto; padding: 0 1.2rem; color: #333; line-height: 1.7; }
-  h1 { font-size: 1.4rem; font-weight: 600; }
-  p { color: #666; }
-  footer { margin-top: 3rem; font-size: 0.8rem; color: #aaa; }
+body{
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;
+    max-width:760px;
+    margin:60px auto;
+    padding:0 20px;
+    color:#333;
+    background:#fafafa;
+    line-height:1.8;
+}
+header{
+    border-bottom:1px solid #ddd;
+    margin-bottom:30px;
+}
+h1{
+    margin-bottom:8px;
+    font-size:2rem;
+}
+.subtitle{
+    color:#777;
+    margin-bottom:20px;
+}
+article{
+    margin-bottom:40px;
+}
+article h2{
+    font-size:1.2rem;
+    margin-bottom:6px;
+}
+.date{
+    color:#999;
+    font-size:.9rem;
+    margin-bottom:12px;
+}
+footer{
+    margin-top:50px;
+    border-top:1px solid #ddd;
+    padding-top:15px;
+    color:#888;
+    font-size:.9rem;
+}
+a{
+    color:#2d6cdf;
+    text-decoration:none;
+}
+a:hover{
+    text-decoration:underline;
+}
 </style>
 </head>
 <body>
-  <h1>这里暂时还没有内容</h1>
-  <p>站点正在整理中,欢迎稍后再来看看。</p>
-  <footer>&copy; <span id="y"></span></footer>
-  <script>document.getElementById('y').textContent = new Date().getFullYear();</script>
+
+<header>
+<h1>Gedanken & Notizen</h1>
+<div class="subtitle">
+Ein persönliches Blog über Technik, Programmierung und den digitalen Alltag.
+</div>
+</header>
+
+<article>
+<h2>Willkommen</h2>
+<div class="date">8. Juli 2026</div>
+<p>
+Dieses Blog dient als Sammlung persönlicher Notizen und kleiner technischer
+Experimente. Neue Beiträge erscheinen unregelmäßig, sobald interessante Themen
+oder Ideen entstehen.
+</p>
+</article>
+
+<article>
+<h2>Aktuelle Projekte</h2>
+<div class="date">30. Juni 2026</div>
+<p>
+Zurzeit beschäftige ich mich hauptsächlich mit Linux, Netzwerktechnik,
+Automatisierung sowie einigen kleinen Open-Source-Projekten. Viele Beiträge
+entstehen zunächst als persönliche Dokumentation und werden später veröffentlicht.
+</p>
+</article>
+
+<article>
+<h2>Über dieses Blog</h2>
+<div class="date">15. Juni 2026</div>
+<p>
+Der Schwerpunkt liegt auf praktischen Erfahrungen statt langen theoretischen
+Erklärungen. Ziel ist es, Lösungen nachvollziehbar zu dokumentieren und
+interessante Entdeckungen festzuhalten.
+</p>
+</article>
+
+<footer>
+© <span id="year"></span> Gedanken & Notizen
+</footer>
+
+<script>
+document.getElementById("year").textContent=new Date().getFullYear();
+</script>
+
 </body>
 </html>
 HOMEEOF
 }
+
 step "安装主页占位内容"
 install_decoy_homepage
 
