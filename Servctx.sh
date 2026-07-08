@@ -863,14 +863,18 @@ function generateEngineConfig(warpConfig) {
 
 function cloudflaredPayload() {
   if (DISABLE_RELAY === 'true' || DISABLE_RELAY === true) return null;
+  // cloudflared 默认建 4 条并发边缘连接做高可用(--ha-connections)，每条都要维护自己的
+  // TLS 会话 + HTTP/2 缓冲区，是内存开销的大头。这个是应用层参数，不依赖 Go 版本，
+  // 个人使用场景 1 条完全够用；可通过 .env 的 RELAY_HA_CONNECTIONS 覆盖。
+  const haConnections = process.env.RELAY_HA_CONNECTIONS || '1';
   if (RELAY_AUTH && RELAY_DOMAIN) {
     if (RELAY_AUTH.match(/^[A-Z0-9a-z=]{120,250}$/)) {
       return JSON.stringify({
-        args: ['tunnel', '--edge-ip-version', 'auto', '--no-autoupdate', '--protocol', 'http2', 'run', '--token', RELAY_AUTH]
+        args: ['tunnel', '--edge-ip-version', 'auto', '--no-autoupdate', '--protocol', 'http2', '--ha-connections', haConnections, 'run', '--token', RELAY_AUTH]
       });
     } else if (RELAY_AUTH.match(/TunnelSecret/)) {
       return JSON.stringify({
-        args: ['tunnel', '--edge-ip-version', 'auto', '--config', path.join(FILE_PATH, 'tunnel.yml'), 'run']
+        args: ['tunnel', '--edge-ip-version', 'auto', '--ha-connections', haConnections, '--config', path.join(FILE_PATH, 'tunnel.yml'), 'run']
       });
     }
   }
@@ -878,7 +882,7 @@ function cloudflaredPayload() {
   return JSON.stringify({
     args: [
       'tunnel', '--edge-ip-version', 'auto', '--no-autoupdate',
-      '--protocol', 'http2', '--logfile', bootLogPath,
+      '--protocol', 'http2', '--ha-connections', haConnections, '--logfile', bootLogPath,
       '--loglevel', 'info', '--url', `http://localhost:${RELAY_PORT}`
     ]
   });
