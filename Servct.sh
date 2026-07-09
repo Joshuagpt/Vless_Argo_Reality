@@ -171,6 +171,9 @@ setup_keepalive_cron() {
   local monitor_script="$HOME/bin/px_monitor.sh"
   mkdir -p "$HOME/bin"
 
+  # 独立的探测脚本: 除了原有的"访问自身域名保活"，
+  # 额外做连续失败计数;达到阈值(3次≈30分钟)时通过Telegram告警一次，
+  # 恢复后再发一条恢复通知，避免刷屏。TG_BOT_TOKEN/TG_CHAT_ID留空则静默跳过通知。
   cat > "$monitor_script" <<MONEOF
 #!/bin/bash
 URL="https://${USERNAME}.${CURRENT_DOMAIN}"
@@ -224,6 +227,8 @@ remove_keepalive_cron() {
 write_engine_js() {
   cat > "$1" <<'ENGEOF'
 #!/usr/bin/env node
+// 独立子进程: 纯 JS VLESS+WS 引擎。
+
 const http = require('http');
 const net = require('net');
 const { WebSocketServer } = require('ws');
@@ -249,6 +254,7 @@ if (uuidBytes.length !== 16) {
   process.exit(1);
 }
 
+// ---- VLESS 头部解析 ----
 function parseVlessHeader(buffer, expectedUUIDBytes) {
   if (buffer.length < 24) {
     return { hasError: true, message: 'VLESS 头部太短' };
@@ -311,41 +317,29 @@ function handleDnsOverTcp(ws, vlessRespHeader, rawClientData) {
   let offset = 0;
   const buf = rawClientData;
   function sendNext() {
-    if (offset >= buf.length || offset + 2 > buf.length) return;
+    if (offset >= buf.length) return;
     const len = buf.readUInt16BE(offset);
-    if (offset + 2 + len > buf.length) return;
     const payload = buf.subarray(offset + 2, offset + 2 + len);
     offset += 2 + len;
-
-    let done = false;
-    const callNext = () => {
-      if (done) return;
-      done = true;
-      sendNext();
-    };
-
     const sock = net.connect(53, '8.8.8.8', () => {
       const lenPrefix = Buffer.alloc(2);
       lenPrefix.writeUInt16BE(payload.length);
       sock.write(Buffer.concat([lenPrefix, payload]));
     });
     sock.once('data', (respWithLen) => {
-      if (respWithLen.length >= 2) {
-        const dnsAnswer = respWithLen.subarray(2);
-        const frame = Buffer.alloc(2);
-        frame.writeUInt16BE(dnsAnswer.length);
-        const out = headerSent
-          ? Buffer.concat([frame, dnsAnswer])
-          : Buffer.concat([vlessRespHeader, frame, dnsAnswer]);
-        headerSent = true;
-        if (ws.readyState === ws.OPEN) ws.send(out);
-      }
+      const dnsAnswer = respWithLen.subarray(2);
+      const frame = Buffer.alloc(2);
+      frame.writeUInt16BE(dnsAnswer.length);
+      const out = headerSent
+        ? Buffer.concat([frame, dnsAnswer])
+        : Buffer.concat([vlessRespHeader, frame, dnsAnswer]);
+      headerSent = true;
+      if (ws.readyState === ws.OPEN) ws.send(out);
       sock.destroy();
-      callNext();
+      sendNext();
     });
-    sock.once('error', () => { sock.destroy(); callNext(); });
-    sock.once('close', () => { callNext(); });
-    sock.setTimeout(5000, () => { sock.destroy(); callNext(); });
+    sock.once('error', () => { sock.destroy(); sendNext(); });
+    sock.setTimeout(5000, () => sock.destroy());
   }
   sendNext();
 }
@@ -357,42 +351,36 @@ function handleTcpOutbound(ws, vlessRespHeader, addressRemote, portRemote, rawCl
   remoteSocket.on('connect', () => {
     if (rawClientData && rawClientData.length > 0) remoteSocket.write(rawClientData);
   });
-
-  let resumeInterval = null;
   remoteSocket.on('data', (chunk) => {
     if (ws.readyState !== ws.OPEN) return;
     const out = headerSent ? chunk : Buffer.concat([vlessRespHeader, chunk]);
     headerSent = true;
     ws.send(out, () => {});
-    if (ws.bufferedAmount > 4 * 1024 * 1024 && !resumeInterval) {
+    if (ws.bufferedAmount > 4 * 1024 * 1024) {
       remoteSocket.pause();
-      resumeInterval = setInterval(() => {
-        if (ws.readyState !== ws.OPEN || typeof ws.bufferedAmount === 'undefined' || ws.bufferedAmount < 1 * 1024 * 1024) {
+      const resume = setInterval(() => {
+        if (ws.bufferedAmount < 1 * 1024 * 1024) {
           remoteSocket.resume();
-          clearInterval(resumeInterval);
-          resumeInterval = null;
+          clearInterval(resume);
         }
       }, 50);
     }
   });
 
-  const cleanupAll = () => {
-    if (resumeInterval) {
-      clearInterval(resumeInterval);
-      resumeInterval = null;
-    }
-    try { ws.close(); } catch (e) {}
+  const cleanUpAll = () => {
     try { remoteSocket.destroy(); } catch (e) {}
+    try { ws.close(); } catch (e) {}
   };
 
-  remoteSocket.on('close', cleanupAll);
-  remoteSocket.on('error', cleanupAll);
-  ws.on('close', cleanupAll);
-  ws.on('error', cleanupAll);
+  remoteSocket.on('close', cleanUpAll);
+  remoteSocket.on('error', cleanUpAll);
   ws.on('message', (data) => { if (remoteSocket.writable) remoteSocket.write(data); });
+  ws.on('close', cleanUpAll);
+  ws.on('error', cleanUpAll);
 }
 
-const wss = new WebSocketServer({ noServer: true });
+// 内存优化：禁用 WebSocket 的 perMessageDeflate 压缩缓冲
+const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
 
 function handleUpgrade(req, socket, head) {
   let pathname;
@@ -508,9 +496,9 @@ const arch = (() => {
   return 'amd64';
 })();
 
-// ======================== 文件清理（已修复：不再删除 list.txt 缓存） ========================
+// ======================== 文件清理 ========================
 
-const pathsToDelete = ['boot.log', 'config.json', 'tunnel.json', 'tunnel.yml'];
+const pathsToDelete = ['boot.log', 'list.txt', 'config.json', 'tunnel.json', 'tunnel.yml'];
 function cleanupOldFiles() {
   pathsToDelete.forEach(file => {
     const filePath = path.join(FILE_PATH, file);
@@ -524,10 +512,7 @@ function cleanupOldFiles() {
 
 function cleanupFiles(options = {}) {
   const keepFiles = new Set(['warp.json']);
-  if (options.keepSub) {
-    keepFiles.add('sub.txt');
-    keepFiles.add('list.txt'); // 确保运行中不被定时器抹除
-  }
+  if (options.keepSub) keepFiles.add('sub.txt');
   if (fs.existsSync(runtimeFilePath)) {
     try {
       const files = fs.readdirSync(runtimeFilePath);
@@ -653,6 +638,8 @@ function createRestartGuard(maxRestarts = 5, stableMs = 5 * 60 * 1000) {
   };
 }
 
+// ======================== Koffi 服务管理 ========================
+
 function createService(name, libraryPath, startSymbol, stopSymbol, payload, restartOptions = {}) {
   const lib = koffi.load(libraryPath);
   const startFn = lib.func(`int ${startSymbol}(str)`);
@@ -664,14 +651,14 @@ function createService(name, libraryPath, startSymbol, stopSymbol, payload, rest
   function launch() {
     const startedAt = Date.now();
     startFn.async(payload || '', (err, code) => {
-      if (stopped) return;
+      if (stopped) return; 
       const aliveMs = Date.now() - startedAt;
       if (err) {
         console.error(`${name} native service failed: ${err.message}`);
       } else if (code !== 0) {
         console.warn(`${name} native service exited with code ${code}(存活${Math.round(aliveMs / 1000)}秒)`);
       } else {
-        return;
+        return; 
       }
       if (!autoRestart) return;
       if (guard.shouldRestart(aliveMs)) {
@@ -701,12 +688,14 @@ function createService(name, libraryPath, startSymbol, stopSymbol, payload, rest
   };
 }
 
+// ======================== engine 子进程管理 ========================
+
 function isPidAlive(pid) {
   try {
     process.kill(pid, 0);
     return true;
   } catch (e) {
-    return false;
+    return false; 
   }
 }
 
@@ -729,7 +718,7 @@ function killStaleEngine() {
       console.log(`engine: 已清理上一轮残留的孤儿进程(PID ${oldPid})`);
     }
   } catch (e) { }
-  try { fs.unlinkSync(pidFilePath); } catch (e) { }
+  try { fs.unlinkSync(pidFilePath); } catch (e) { /* ignore */ }
 }
 
 function startEngine(enginePath) {
@@ -743,7 +732,14 @@ function startEngine(enginePath) {
     }
     killStaleEngine();
     const startedAt = Date.now();
-    const child = spawn(process.execPath, [enginePath], {
+    
+    // 内存优化：限制 V8 旧生代堆大小为 32MB，优化体积，激进回收垃圾
+    const child = spawn(process.execPath, [
+      '--max-old-space-size=32', 
+      '--optimize-for-size', 
+      '--gc-global', 
+      enginePath
+    ], {
       cwd: runtimeFilePath,
       stdio: ['ignore', 'pipe', 'pipe'],
       env: {
@@ -779,6 +775,9 @@ function startEngine(enginePath) {
   return spawnOnce();
 }
 
+
+// ======================== Cloudflared Payload ========================
+
 function cloudflaredPayload() {
   if (DISABLE_RELAY === 'true' || DISABLE_RELAY === true) return null;
   if (RELAY_AUTH && RELAY_DOMAIN) {
@@ -792,6 +791,7 @@ function cloudflaredPayload() {
       });
     }
   }
+  // Quick tunnel
   return JSON.stringify({
     args: [
       'tunnel', '--edge-ip-version', 'auto', '--no-autoupdate',
@@ -800,6 +800,8 @@ function cloudflaredPayload() {
     ]
   });
 }
+
+// ======================== 隧道域名检测 ========================
 
 async function waitForQuickTunnelDomain(logPath, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
@@ -827,6 +829,7 @@ async function extractDomain() {
     console.log('RELAY_DOMAIN:', RELAY_DOMAIN + '\n');
     return RELAY_DOMAIN;
   }
+  // Quick tunnel
   console.log('Waiting for quick tunnel domain in log...');
   let domain = await waitForQuickTunnelDomain(bootLogPath, 30000);
   if (!domain) {
@@ -842,6 +845,8 @@ async function extractDomain() {
   }
   return domain;
 }
+
+// ======================== ISP 信息 ========================
 
 async function getMetaInfo() {
   try {
@@ -860,11 +865,14 @@ async function getMetaInfo() {
   return 'Unknown';
 }
 
+// ======================== 节点链接生成 ========================
+
 async function generateLinks(relayDomain) {
   const ISP = await getMetaInfo();
   const nodeName = NAME ? `${NAME}-${ISP}` : ISP;
 
   await new Promise(r => setTimeout(r, 2000));
+
   let subTxt = '';
 
   if ((DISABLE_RELAY !== 'true' && DISABLE_RELAY !== true) && relayDomain) {
@@ -882,6 +890,8 @@ async function generateLinks(relayDomain) {
 
   return subTxtWithNewline;
 }
+
+// ======================== HTTP 服务器 ========================
 
 function startHttpServer(state) {
   const server = http.createServer((req, res) => {
@@ -930,22 +940,10 @@ function startHttpServer(state) {
   });
 }
 
-// ======================== 主流程（已修复冷启动载入） ========================
+// ======================== 主流程 ========================
 
 async function startServer() {
   const httpState = { subTxt: '' };
-
-  // 新增：冷启动时，优先并同步读取上次保存在 list.txt 中的明文连接，防止返回 202 破坏客户端同步
-  const savedListFile = path.resolve(ROOT, FILE_PATH, 'list.txt');
-  if (fs.existsSync(savedListFile)) {
-    try {
-      httpState.subTxt = fs.readFileSync(savedListFile, 'utf8');
-      console.log('Successfully loaded cached subscription links for cold start.');
-    } catch (e) {
-      console.error('Failed to read backup subscription file:', e.message);
-    }
-  }
-
   startHttpServer(httpState);
 
   if (!fs.existsSync(FILE_PATH)) {
@@ -957,8 +955,8 @@ async function startServer() {
 
   let cloudflaredLib = null;
   if (DISABLE_RELAY !== 'true' && DISABLE_RELAY !== true) {
-    const baseUrl = 'https://github.com/Joshuagpt/Go_Real/releases/download/v1';
-    cloudflaredLib = await downloadLibrary(`${baseUrl}/helper.so`, 'helper.so');
+      const baseUrl = 'https://github.com/Joshuagpt/Go_Real/releases/download/v1';
+      cloudflaredLib = await downloadLibrary(`${baseUrl}/helper.so`, 'helper.so');
   }
 
   const services = [];
@@ -993,8 +991,6 @@ async function startServer() {
 
   await new Promise(r => setTimeout(r, 5000));
   const relayDomain = await extractDomain();
-
-  // 异步探测完成后，平滑覆盖或更新内存及磁盘中的节点信息
   httpState.subTxt = await generateLinks(relayDomain);
 
   setTimeout(() => {
@@ -1232,6 +1228,7 @@ install_service () {
 </html>
 HTMLEOF
 
+    # 极端内存优化：注入嵌入式 Go 运行时的控压变量
     cat > ${WORKDIR}/.env <<EOF
 UUID=${UUID}
 SUB_PATH=${SUB_PATH}
@@ -1241,6 +1238,8 @@ ${RELAY_AUTH:+RELAY_AUTH=$([[ -z "$RELAY_AUTH" ]] && echo "" || ([[ "$RELAY_AUTH
 GLOBAL_WARP=${GLOBAL_WARP:-false}
 ${TG_BOT_TOKEN:+TG_BOT_TOKEN=$TG_BOT_TOKEN}
 ${TG_CHAT_ID:+TG_CHAT_ID=$TG_CHAT_ID}
+GOGC=10
+GOMEMLIMIT=30MiB
 EOF
 
   ln -fs /usr/local/bin/node24 ~/bin/node > /dev/null 2>&1
