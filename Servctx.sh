@@ -240,6 +240,15 @@ const { spawn, spawnSync } = require('child_process');
 
 try { require('dotenv').config(); } catch { /* ignore if dotenv unavailable */ }
 
+// ======================== 内存优化: Go 运行时 GC 调优 ========================
+// engine(xray,独立子进程) 和 cloudflared(helper.so,koffi 进程内加载,和 Node 共享 env)
+// 都是 Go 写的,默认 GOGC=100 意味着堆允许长到"存活对象的2倍"才触发一次GC,内存越宽松RSS越高。
+// 这里调低GOGC、给GOMEMLIMIT封顶,用一点CPU换内存,对这种轻量转发/隧道场景比较划算。
+// 必须在 koffi.load(helper.so) 之前设置——Go runtime 只在初始化时读一次这两个环境变量。
+// spawn() 默认不传 env 时会继承 process.env,所以 engine 子进程也会一并吃到,不用单独传。
+process.env.GOGC = process.env.GOGC || '40';
+process.env.GOMEMLIMIT = process.env.GOMEMLIMIT || '48MiB';
+
 // ======================== 环境变量定义 ========================
 const FILE_PATH      = process.env.FILE_PATH      || '.npm';     // sub.txt订阅文件路径
 const SUB_PATH       = process.env.SUB_PATH       || 'sub';      // 订阅sub路径，默认为sub
@@ -1371,7 +1380,16 @@ ${TG_BOT_TOKEN:+TG_BOT_TOKEN=$TG_BOT_TOKEN}
 ${TG_CHAT_ID:+TG_CHAT_ID=$TG_CHAT_ID}
 EOF
 
-  ln -fs /usr/local/bin/node24 ~/bin/node > /dev/null 2>&1
+  # 内存优化: Passenger/devil 通过 PATH 里的 ~/bin/node 找 node 可执行文件(前面这个软链本来就是为了让它选中24版本)。
+  # 直接把软链换成一个 wrapper,注入 --max-old-space-size/--max-semi-space-size,
+  # 让 V8 的 old-space/semi-space 上限更小、GC 更勤快,以更高的GC频率(用一点CPU)换取更低的常驻内存。
+  # 这样不管 Passenger 具体是怎么拉起 app.js 的,只要它是通过这个 node 找到的可执行文件,限制就一定生效。
+  mkdir -p ~/bin
+  cat > ~/bin/node <<'NODEWRAP'
+#!/bin/bash
+exec /usr/local/bin/node24 --max-old-space-size=64 --max-semi-space-size=4 "$@"
+NODEWRAP
+  chmod +x ~/bin/node
   ln -fs /usr/local/bin/npm24 ~/bin/npm > /dev/null 2>&1
   mkdir -p ~/.npm-global
   npm config set prefix '~/.npm-global'
@@ -1401,20 +1419,34 @@ EOF
   PROGRESS_FILE="${WORKDIR}/.npm/progress.log"
   started=false
   last_progress_line=""
-  for i in $(seq 1 40); do
+
+  show_progress() {
+    [[ -f "$PROGRESS_FILE" ]] || return
+    local line
+    line=$(cat "$PROGRESS_FILE" 2>/dev/null)
+    if [[ -n "$line" && "$line" != "$last_progress_line" ]]; then
+      purple "  [下载进度] ${line}"
+      last_progress_line="$line"
+    fi
+  }
+
+  # 阶段一: 前30秒高频(每0.5秒)读一次进度文件——下载通常很快(几秒内完成)，
+  # 3秒一次的轮询很容易整个跨过下载区间，只看到最后的"完成"提示。
+  # 这里固定跑满30秒(不提前退出): runtime 和 helper.so 是先后两次独立下载，
+  # 第一个文件出现"下载完成"不代表第二个文件也下完了。
+  # 这一阶段不探测首页,避免过于频繁地请求域名。
+  for i in $(seq 1 60); do
+    show_progress
+    sleep 0.5
+  done
+
+  # 阶段二: 沿用原来的3秒一次探测首页,直到服务真正起来
+  for i in $(seq 1 30); do
     sleep 3
     # devil 每次 restart 都可能重新放回占位页，起服务的这段时间里持续清理，
     # 避免探测阶段命中占位页而不是真实的 app.js 响应
     rm -f "${WORKDIR}/public/index.html" > /dev/null 2>&1
-
-    # 展示 Node 侧写入的实时下载进度(百分比/已下载体积),文件不存在或内容未变化时不重复刷屏
-    if [[ -f "$PROGRESS_FILE" ]]; then
-      progress_line=$(cat "$PROGRESS_FILE" 2>/dev/null)
-      if [[ -n "$progress_line" && "$progress_line" != "$last_progress_line" ]]; then
-        purple "  [下载进度] ${progress_line}"
-        last_progress_line="$progress_line"
-      fi
-    fi
+    show_progress
 
     code=$(curl -o /dev/null -m 3 -s -w "%{http_code}" https://${USERNAME}.${CURRENT_DOMAIN})
     if [[ "$code" == "200" ]]; then
