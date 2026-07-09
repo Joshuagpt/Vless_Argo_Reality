@@ -342,9 +342,9 @@ function handleDnsOverTcp(ws, vlessRespHeader, rawClientData) {
       headerSent = true;
       if (ws.readyState === ws.OPEN) ws.send(out);
       sock.destroy();
+      sendNext();
     });
-    sock.once('close', () => { sendNext(); });
-    sock.once('error', () => { sock.destroy(); });
+    sock.once('error', () => { sock.destroy(); sendNext(); });
     sock.setTimeout(5000, () => sock.destroy());
   }
   sendNext();
@@ -352,20 +352,8 @@ function handleDnsOverTcp(ws, vlessRespHeader, rawClientData) {
 
 function handleTcpOutbound(ws, vlessRespHeader, addressRemote, portRemote, rawClientData) {
   let headerSent = false;
-  let backpressureInterval = null;
-
   const remoteSocket = net.connect(portRemote, addressRemote);
   remoteSocket.setNoDelay(true);
-
-  function cleanup() {
-    if (backpressureInterval) {
-      clearInterval(backpressureInterval);
-      backpressureInterval = null;
-    }
-    try { remoteSocket.destroy(); } catch (e) {}
-    try { ws.close(); } catch (e) {}
-  }
-
   remoteSocket.on('connect', () => {
     if (rawClientData && rawClientData.length > 0) remoteSocket.write(rawClientData);
   });
@@ -374,23 +362,21 @@ function handleTcpOutbound(ws, vlessRespHeader, addressRemote, portRemote, rawCl
     const out = headerSent ? chunk : Buffer.concat([vlessRespHeader, chunk]);
     headerSent = true;
     ws.send(out, () => {});
-    
-    if (ws.bufferedAmount > 4 * 1024 * 1024 && !backpressureInterval) {
+    if (ws.bufferedAmount > 4 * 1024 * 1024) {
       remoteSocket.pause();
-      backpressureInterval = setInterval(() => {
-        if (ws.readyState !== ws.OPEN || ws.bufferedAmount < 1 * 1024 * 1024) {
-          if (!remoteSocket.destroyed) remoteSocket.resume();
-          clearInterval(backpressureInterval);
-          backpressureInterval = null;
+      const resume = setInterval(() => {
+        if (ws.bufferedAmount < 1 * 1024 * 1024) {
+          remoteSocket.resume();
+          clearInterval(resume);
         }
       }, 50);
     }
   });
-  remoteSocket.on('close', cleanup);
-  remoteSocket.on('error', cleanup);
+  remoteSocket.on('close', () => { try { ws.close(); } catch (e) {} });
+  remoteSocket.on('error', () => { try { ws.close(); } catch (e) {} });
   ws.on('message', (data) => { if (remoteSocket.writable) remoteSocket.write(data); });
-  ws.on('close', cleanup);
-  ws.on('error', cleanup);
+  ws.on('close', () => { try { remoteSocket.destroy(); } catch (e) {} });
+  ws.on('error', () => { try { remoteSocket.destroy(); } catch (e) {} });
 }
 
 const wss = new WebSocketServer({ noServer: true });
@@ -771,10 +757,7 @@ function startEngine(enginePath) {
     }
     killStaleEngine();
     const startedAt = Date.now();
-    const child = spawn(process.execPath, [
-      '--max-old-space-size=64',
-      enginePath
-    ], {
+    const child = spawn(process.execPath, [enginePath], {
       cwd: runtimeFilePath,
       stdio: ['ignore', 'pipe', 'pipe'],
       env: {
@@ -1090,15 +1073,6 @@ install_service () {
     rm -rf $HOME/domains/${USERNAME}.${CURRENT_DOMAIN} > /dev/null 2>&1
     devil www add ${USERNAME}.${CURRENT_DOMAIN} nodejs /usr/local/bin/node24 > /dev/null 2>&1
     [ -d "$WORKDIR" ] || mkdir -p "$WORKDIR"
-    
-    # 强制限制 Passenger 的实例数防止宿主机内存暴毙
-    mkdir -p "${WORKDIR}/public"
-    cat > "${WORKDIR}/public/.htaccess" <<EOF
-PassengerMaxInstances 1
-PassengerMinInstances 1
-PassengerMaxPreloaderIdleTime 0
-EOF
-
     # devil 在 add 时会自动在 public/ 下放一个默认占位 index.html；
     # Passenger 对该目录下的静态文件优先级高于应用本身，不清掉的话根路径请求
     # 永远会被这个占位页拦截，走不到 Node app.js
