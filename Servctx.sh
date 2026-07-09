@@ -244,11 +244,13 @@ try { require('dotenv').config(); } catch { /* ignore if dotenv unavailable */ }
 // ======================== 内存优化: Go 运行时 GC 调优 ========================
 // engine(xray,独立子进程) 和 cloudflared(helper.so,koffi 进程内加载,和 Node 共享 env)
 // 都是 Go 写的,默认 GOGC=100 意味着堆允许长到"存活对象的2倍"才触发一次GC,内存越宽松RSS越高。
-// 这里调低GOGC、给GOMEMLIMIT封顶,用一点CPU换内存,对这种轻量转发/隧道场景比较划算。
-// 必须在 koffi.load(helper.so) 之前设置——Go runtime 只在初始化时读一次这两个环境变量。
+// 注意: 不设置 GOMEMLIMIT——它是"软上限",Go 会拼命更频繁地 GC 去逼近这个数字,
+// 你这边还挂着 WARP(wireguard/UDP,对延迟抖动敏感),GC 压力太大很容易把隧道拖到不可用,
+// 之前设成48MiB就是导致"节点不通"的原因,砍掉。
+// GOGC 只做温和调整(80,而不是激进的40),用很小的CPU代价换一点内存,不去逼近任何硬/软上限。
+// 必须在 koffi.load(helper.so) 之前设置——Go runtime 只在初始化时读一次这个环境变量。
 // spawn() 默认不传 env 时会继承 process.env,所以 engine 子进程也会一并吃到,不用单独传。
-process.env.GOGC = process.env.GOGC || '40';
-process.env.GOMEMLIMIT = process.env.GOMEMLIMIT || '48MiB';
+process.env.GOGC = process.env.GOGC || '80';
 
 // 用内置 fetch 替代 axios 的极简封装: 只覆盖这个脚本实际用到的 GET/POST JSON 场景,
 // 少一个 axios(以及它连带的 follow-redirects/form-data/proxy-from-env 等依赖)。
