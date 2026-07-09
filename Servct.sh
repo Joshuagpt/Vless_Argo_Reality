@@ -1002,7 +1002,16 @@ if (DISABLE_RELAY !== 'true' && DISABLE_RELAY !== true) {
   }, 45000);
 }
 
-startServer();
+process.on('uncaughtException', err => {
+  console.error('未捕获的异常(uncaughtException):', err && err.stack || err);
+});
+process.on('unhandledRejection', err => {
+  console.error('未处理的 Promise rejection(unhandledRejection):', err && err.stack || err);
+});
+
+startServer().catch(err => {
+  console.error('startServer() 执行失败:', err && err.stack || err);
+});
 setInterval(() => {}, 1000);
 JSEOF
 }
