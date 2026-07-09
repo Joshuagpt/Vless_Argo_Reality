@@ -171,9 +171,6 @@ setup_keepalive_cron() {
   local monitor_script="$HOME/bin/px_monitor.sh"
   mkdir -p "$HOME/bin"
 
-  # 独立的探测脚本: 除了原有的"访问自身域名保活"，
-  # 额外做连续失败计数;达到阈值(3次≈30分钟)时通过Telegram告警一次，
-  # 恢复后再发一条恢复通知，避免刷屏。TG_BOT_TOKEN/TG_CHAT_ID留空则静默跳过通知。
   cat > "$monitor_script" <<MONEOF
 #!/bin/bash
 URL="https://${USERNAME}.${CURRENT_DOMAIN}"
@@ -227,12 +224,6 @@ remove_keepalive_cron() {
 write_engine_js() {
   cat > "$1" <<'ENGEOF'
 #!/usr/bin/env node
-// 独立子进程: 纯 JS VLESS+WS 引擎。之所以不直接跑在 app.js 里，是因为 Phusion Passenger
-// 的 Node "auto-install" 机制会把进程里第一次调用 .listen() 的 http.Server 自动接管当成
-// 自己的请求入口，同一个进程里不允许出现第二次 .listen()。engine 独立成子进程后，它的
-// .listen() 调用发生在另一个 OS 进程里，Passenger 完全看不到，不会冲突；副作用是内存
-// 核算也更干净，能单独用 --max-old-space-size 卡住这个进程自己的堆。
-
 const http = require('http');
 const net = require('net');
 const { WebSocketServer } = require('ws');
@@ -241,8 +232,6 @@ const UUID = process.env.UUID || '';
 const RELAY_PORT = Number(process.env.RELAY_PORT) || 8001;
 const WS_PATH = process.env.WS_PATH || '/data-sync';
 
-// 把自己的 PID 写到当前目录(cwd 是 runtimeFilePath)下的 engine.pid，
-// 给 app.js 下次启动时用来清理上一轮可能残留的孤儿进程(见 app.js 里 startEngine 的说明)
 const fs = require('fs');
 const pidFilePath = 'engine.pid';
 try { fs.writeFileSync(pidFilePath, String(process.pid)); } catch (e) { /* ignore */ }
@@ -260,7 +249,6 @@ if (uuidBytes.length !== 16) {
   process.exit(1);
 }
 
-// ---- VLESS 头部解析 ----
 function parseVlessHeader(buffer, expectedUUIDBytes) {
   if (buffer.length < 24) {
     return { hasError: true, message: 'VLESS 头部太短' };
@@ -488,22 +476,20 @@ const { spawn } = require('child_process');
 
 try { require('dotenv').config(); } catch { /* ignore if dotenv unavailable */ }
 
-// ======================== 环境变量定义 ========================
-const FILE_PATH      = process.env.FILE_PATH      || '.npm';     // sub.txt订阅文件路径
-const SUB_PATH       = process.env.SUB_PATH       || 'sub';      // 订阅sub路径，默认为sub
-const UUID           = process.env.UUID           || '68aa231f-703e-4547-967e-12ed0b36420f'; // UUID
-const RELAY_DOMAIN    = process.env.RELAY_DOMAIN    || '';         // relay固定隧道域名,留空即使用临时隧道
-const RELAY_AUTH      = process.env.RELAY_AUTH      || '';         // relay固定隧道token或json,留空即使用临时隧道
-const RELAY_PORT      = Number(process.env.RELAY_PORT) || 8001;    // relay固定隧道端口(本地监听端口)
-const CFIP           = process.env.CFIP           || 'ali.ztyawc.de'; // 优选域名或优选IP
-const CFPORT         = Number(process.env.CFPORT) || 443;        // 优选域名或优选IP对应端口
-const PORT           = Number(process.env.PORT)   || 3000;       // http订阅端口
-const NAME           = process.env.NAME           || '';         // 节点名称
-const DISABLE_RELAY   = process.env.DISABLE_RELAY   || false;      // 设置为true时禁用relay
-const GLOBAL_WARP    = String(process.env.GLOBAL_WARP).toLowerCase() === 'true'; // true时全部出站走WARP，否则不启用WARP
-const TG_BOT_TOKEN    = process.env.TG_BOT_TOKEN    || '';        // Telegram Bot Token,留空则不发送告警
-const TG_CHAT_ID      = process.env.TG_CHAT_ID      || '';        // Telegram Chat ID,留空则不发送告警
-// ==============================================================
+const FILE_PATH      = process.env.FILE_PATH      || '.npm';     
+const SUB_PATH       = process.env.SUB_PATH       || 'sub';      
+const UUID           = process.env.UUID           || '68aa231f-703e-4547-967e-12ed0b36420f'; 
+const RELAY_DOMAIN    = process.env.RELAY_DOMAIN    || '';         
+const RELAY_AUTH      = process.env.RELAY_AUTH      || '';         
+const RELAY_PORT      = Number(process.env.RELAY_PORT) || 8001;    
+const CFIP           = process.env.CFIP           || 'ali.ztyawc.de'; 
+const CFPORT         = Number(process.env.CFPORT) || 443;        
+const PORT           = Number(process.env.PORT)   || 3000;       
+const NAME           = process.env.NAME           || '';         
+const DISABLE_RELAY   = process.env.DISABLE_RELAY   || false;      
+const GLOBAL_WARP    = String(process.env.GLOBAL_WARP).toLowerCase() === 'true'; 
+const TG_BOT_TOKEN    = process.env.TG_BOT_TOKEN    || '';        
+const TG_CHAT_ID      = process.env.TG_CHAT_ID      || '';        
 
 const ROOT = process.cwd();
 const runtimeFilePath = path.resolve(ROOT, FILE_PATH);
@@ -519,9 +505,8 @@ const arch = (() => {
   return 'amd64';
 })();
 
-// ======================== 文件清理 ========================
-
-const pathsToDelete = ['boot.log', 'list.txt', 'config.json', 'tunnel.json', 'tunnel.yml'];
+// 移除了 list.txt，防止其被误杀清空
+const pathsToDelete = ['boot.log', 'config.json', 'tunnel.json', 'tunnel.yml'];
 function cleanupOldFiles() {
   pathsToDelete.forEach(file => {
     const filePath = path.join(FILE_PATH, file);
@@ -535,7 +520,10 @@ function cleanupOldFiles() {
 
 function cleanupFiles(options = {}) {
   const keepFiles = new Set(['warp.json']);
-  if (options.keepSub) keepFiles.add('sub.txt');
+  if (options.keepSub) {
+    keepFiles.add('sub.txt');
+    keepFiles.add('list.txt'); // 确保 list.txt 在 45 秒大清理时不会被删掉
+  }
   if (fs.existsSync(runtimeFilePath)) {
     try {
       const files = fs.readdirSync(runtimeFilePath);
@@ -549,7 +537,7 @@ function cleanupFiles(options = {}) {
           } else {
             fs.unlinkSync(filePath);
           }
-        } catch (e) { /* skip locked/in-use files */ }
+        } catch (e) { }
       }
     } catch (e) {
       console.error('Cleanup failed:', e.message);
@@ -564,8 +552,6 @@ function cleanupFiles(options = {}) {
 function clearConsole() {
   process.stdout.write('\x1Bc');
 }
-
-// ======================== Relay 隧道配置 ========================
 
 function relayType() {
   if (DISABLE_RELAY === 'true' || DISABLE_RELAY === true) {
@@ -595,11 +581,6 @@ function relayType() {
     console.log(`Using token connect to tunnel, please set ${RELAY_PORT} in cloudflare`);
   }
 }
-
-// ======================== WARP: 暂不支持 ========================
-// 纯 JS 引擎目前只做直连转发(direct)，没有实现 WireGuard/wireguard 出站，
-// 之前基于 xray wireguard outbound 的 WARP 相关逻辑(注册身份、UDP探测、
-// engine兼容性探测等)随 engine 一起移除。GLOBAL_WARP 这个环境变量目前是 no-op。
 
 async function sha256Matches(filePath, expected) {
   if (!expected) return true;
@@ -640,10 +621,6 @@ async function downloadLibrary(url, fileName, expectedSha256) {
   return target;
 }
 
-// ======================== 告警通知 ========================
-// 仅在 Node 主进程仍存活、但某个子组件反复崩溃/重启耗尽时使用；
-// 若 Node 主进程本身挂了，这里发不出任何东西——那种情况由 bash 侧的
-// px_monitor.sh(crontab 每10分钟探测一次)负责兜底告警。
 async function notifyFatal(message) {
   if (!TG_BOT_TOKEN || !TG_CHAT_ID) return;
   try {
@@ -656,10 +633,6 @@ async function notifyFatal(message) {
   }
 }
 
-// ======================== 重启节流器(滑动窗口式) ========================
-// 与"从进程启动至今累计崩溃次数"不同: 只要这一次运行存活时间达到 stableMs，
-// 就说明期间是健康的，重启计数清零。这样只有短时间内反复崩溃才会耗尽重启次数，
-// 长期运行、偶尔崩一次的场景不会被历史记录拖累到最终放弃重启。
 function createRestartGuard(maxRestarts = 5, stableMs = 5 * 60 * 1000) {
   let restarts = 0;
   return {
@@ -674,8 +647,6 @@ function createRestartGuard(maxRestarts = 5, stableMs = 5 * 60 * 1000) {
   };
 }
 
-// ======================== Koffi 服务管理 ========================
-
 function createService(name, libraryPath, startSymbol, stopSymbol, payload, restartOptions = {}) {
   const lib = koffi.load(libraryPath);
   const startFn = lib.func(`int ${startSymbol}(str)`);
@@ -687,14 +658,14 @@ function createService(name, libraryPath, startSymbol, stopSymbol, payload, rest
   function launch() {
     const startedAt = Date.now();
     startFn.async(payload || '', (err, code) => {
-      if (stopped) return; // 主动调用了 stop()，不算崩溃，不重启
+      if (stopped) return; 
       const aliveMs = Date.now() - startedAt;
       if (err) {
         console.error(`${name} native service failed: ${err.message}`);
       } else if (code !== 0) {
         console.warn(`${name} native service exited with code ${code}(存活${Math.round(aliveMs / 1000)}秒)`);
       } else {
-        return; // code === 0 视为正常退出，不重启
+        return; 
       }
       if (!autoRestart) return;
       if (guard.shouldRestart(aliveMs)) {
@@ -724,23 +695,12 @@ function createService(name, libraryPath, startSymbol, stopSymbol, payload, rest
   };
 }
 
-// ======================== engine 子进程管理 ========================
-// engine 现在是独立的 node 子进程(engine.js)，原因见 engine.js 顶部注释：
-// Phusion Passenger 的 auto-install 机制不允许同一个 Node 进程里出现第二次 .listen()。
-// 复用跟 cloudflared 一样的滑动窗口重启逻辑；崩溃只会影响这一个子进程，不牵连 Node 主进程。
-//
-// 关键点: engine.js 独立于 app.js 存在，正是为了让它不受 Passenger 因 idle 回收
-// app.js 主进程的影响——回收只发生在 app.js 身上，engine.js 作为脱离的子进程会
-// 继续存活并处理已建立的代理连接。如果这里无脑"发现有旧 pid 就杀掉重开"，
-// 就等于每次 app.js 被 Passenger 回收重启，都会连带打断所有正在用的代理连接
-// (对 WoW 这类长连接游戏流量尤其致命)。所以只有确认旧进程已经不在了，才清理;
-// 如果还活着，直接复用，不再新开一个。
 function isPidAlive(pid) {
   try {
     process.kill(pid, 0);
     return true;
   } catch (e) {
-    return false; // ESRCH: 进程不存在
+    return false; 
   }
 }
 
@@ -762,10 +722,8 @@ function killStaleEngine() {
       process.kill(oldPid, 'SIGKILL');
       console.log(`engine: 已清理上一轮残留的孤儿进程(PID ${oldPid})`);
     }
-  } catch (e) {
-    // 文件不存在，或者进程已经不在了(ESRCH)，都属于正常情况，忽略
-  }
-  try { fs.unlinkSync(pidFilePath); } catch (e) { /* ignore */ }
+  } catch (e) { }
+  try { fs.unlinkSync(pidFilePath); } catch (e) { }
 }
 
 function startEngine(enginePath) {
@@ -774,14 +732,11 @@ function startEngine(enginePath) {
   function spawnOnce() {
     const oldPid = readStaleEnginePid();
     if (oldPid && isPidAlive(oldPid)) {
-      // 上一轮的 engine 还活着(大概率是 app.js 被 Passenger 回收重启，
-      // 但这个独立子进程没有被牵连)，直接复用，不打断正在跑的连接。
       console.log(`engine: 复用仍存活的上一轮 engine 进程(PID ${oldPid})，不重新启动`);
       return null;
     }
     killStaleEngine();
     const startedAt = Date.now();
-    // 注入 --max-old-space-size=64 硬性卡住该引擎子进程的 V8 堆上限，大幅度削减 Serv00 总运行内存常驻
     const child = spawn(process.execPath, ['--max-old-space-size=64', enginePath], {
       cwd: runtimeFilePath,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -818,9 +773,6 @@ function startEngine(enginePath) {
   return spawnOnce();
 }
 
-
-// ======================== Cloudflared Payload ========================
-
 function cloudflaredPayload() {
   if (DISABLE_RELAY === 'true' || DISABLE_RELAY === true) return null;
   if (RELAY_AUTH && RELAY_DOMAIN) {
@@ -834,7 +786,6 @@ function cloudflaredPayload() {
       });
     }
   }
-  // Quick tunnel
   return JSON.stringify({
     args: [
       'tunnel', '--edge-ip-version', 'auto', '--no-autoupdate',
@@ -843,8 +794,6 @@ function cloudflaredPayload() {
     ]
   });
 }
-
-// ======================== 隧道域名检测 ========================
 
 async function waitForQuickTunnelDomain(logPath, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
@@ -857,13 +806,10 @@ async function waitForQuickTunnelDomain(logPath, timeoutMs) {
           return matches[matches.length - 1][1];
         }
       }
-    } catch (e) { /* file may not exist yet */ }
+    } catch (e) { }
     const remaining = deadline - Date.now();
     if (remaining <= 0) break;
     const sleepMs = Math.min(1000, remaining);
-    // 注意: 这里必须用非阻塞的 setTimeout，不能用 Atomics.wait 同步阻塞主线程——
-    // 否则会连带冻结 HTTP server 和 engine 子进程的 stdout 事件循环，
-    // 拖慢/拖死 Passenger 认为的"进程已就绪"判定。
     await new Promise(r => setTimeout(r, sleepMs));
   }
   return null;
@@ -875,7 +821,6 @@ async function extractDomain() {
     console.log('RELAY_DOMAIN:', RELAY_DOMAIN + '\n');
     return RELAY_DOMAIN;
   }
-  // Quick tunnel
   console.log('Waiting for quick tunnel domain in log...');
   let domain = await waitForQuickTunnelDomain(bootLogPath, 30000);
   if (!domain) {
@@ -892,8 +837,6 @@ async function extractDomain() {
   return domain;
 }
 
-// ======================== ISP 信息 ========================
-
 async function getMetaInfo() {
   try {
     const response1 = await axios.get('https://api.ip.sb/geoip', { headers: { 'User-Agent': 'Mozilla/5.0', timeout: 3000 } });
@@ -906,12 +849,10 @@ async function getMetaInfo() {
       if (response2.data && response2.data.status === 'success' && response2.data.countryCode && response2.data.org) {
         return `${response2.data.countryCode}-${response2.data.org}`.replace(/\s+/g, '_');
       }
-    } catch (error) { /* backup also failed */ }
+    } catch (error) { }
   }
   return 'Unknown';
 }
-
-// ======================== 节点链接生成 ========================
 
 async function generateLinks(relayDomain) {
   const ISP = await getMetaInfo();
@@ -920,14 +861,11 @@ async function generateLinks(relayDomain) {
   await new Promise(r => setTimeout(r, 2000));
 
   let subTxt = '';
-
-  // 节点链接生成 (relay)
   if ((DISABLE_RELAY !== 'true' && DISABLE_RELAY !== true) && relayDomain) {
     const linkPath = encodeURIComponent('/data-sync?ed=2560');
     subTxt = `vless://${UUID}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${relayDomain}&fp=chrome&type=ws&host=${relayDomain}&path=${linkPath}#${encodeURIComponent(nodeName)}`;
   }
 
-  // 打印绿色 base64 编码
   console.log('\x1b[32m' + Buffer.from(subTxt).toString('base64') + '\x1b[0m');
   console.log('\n\x1b[35m' + 'Logs will be deleted in 45 seconds, you can copy the above nodes' + '\x1b[0m');
 
@@ -939,8 +877,6 @@ async function generateLinks(relayDomain) {
   return subTxtWithNewline;
 }
 
-// ======================== HTTP 服务器 ========================
-
 function startHttpServer(state) {
   const server = http.createServer((req, res) => {
     if (req.method !== 'GET') {
@@ -951,8 +887,6 @@ function startHttpServer(state) {
     const url = new URL(req.url, `http://localhost`);
     if (url.pathname === subscribePath) {
       if (!state.subTxt) {
-        // 节点链接还没生成完(隧道域名探测/下载依赖等还在跑)，先给个 202
-        // 而不是让 Passenger 因为端口没绑定而超时判死并反复重启进程
         res.statusCode = 202;
         res.setHeader('Content-Type', 'text/plain; charset=utf-8');
         res.end('starting, please retry shortly');
@@ -990,50 +924,32 @@ function startHttpServer(state) {
   });
 }
 
-// ======================== 主流程 ========================
-
 async function startServer() {
-  // 0. 立刻绑定 HTTP 端口。Passenger 是靠"进程有没有把 PORT 端口监听起来"
-  //    来判断应用是否就绪的，之前把 server.listen 放在下载 helper.so / 探测
-  //    隧道域名(quick tunnel 最坏情况下要阻塞近 65 秒)之后，导致 Passenger
-  //    在端口还没绑定时就判超时、返回500，然后在下一次请求时重新 spawn 一个
-  //    全新的 app.js 进程——于是永远卡在"刚起步就被杀掉重启"的循环里。
   const httpState = { subTxt: '' };
+  
+  // 核心优化：如果上次运行的节点缓存文件存在，立刻加载它，防止客户端在进程唤醒时收到空数据
+  if (fs.existsSync(listPath)) {
+    try {
+      httpState.subTxt = fs.readFileSync(listPath, 'utf8');
+    } catch (e) { }
+  }
+  
   startHttpServer(httpState);
 
-  // 1. 创建运行目录 + 清理文件
   if (!fs.existsSync(FILE_PATH)) {
     fs.mkdirSync(FILE_PATH);
     console.log(`${FILE_PATH} is created`);
   }
   cleanupOldFiles();
-
-  // 2. 生成 Relay 隧道配置
   relayType();
 
-  // 3. 下载核心程序: 现在只有 cloudflared 需要下载(仍沿用 koffi 的 .so)。
-  //    engine 是独立子进程(engine.js)，见其文件顶部注释，原因是 Passenger 的
-  //    auto-install 机制不允许同一个 Node 进程里出现第二次 .listen()。
+  let cloudflaredLib = null;
+  if (DISABLE_RELAY !== 'true' && DISABLE_RELAY !== true) {
+      const baseUrl = 'https://github.com/Joshuagpt/Go_Real/releases/download/v1';
+      cloudflaredLib = await downloadLibrary(`${baseUrl}/helper.so`, 'helper.so');
+  }
 
-let cloudflaredLib = null;
-
-if (DISABLE_RELAY !== 'true' && DISABLE_RELAY !== true) {
-
-    const baseUrl =
-    'https://github.com/Joshuagpt/Go_Real/releases/download/v1';
-
-    cloudflaredLib =
-    await downloadLibrary(
-        `${baseUrl}/helper.so`,
-        'helper.so'
-    );
-
-}
-
-  // 4. 启动服务
   const services = [];
-
-  // cloudflared(仍是 koffi 进程内加载,未改动)
   let cloudflaredService = null;
   if (cloudflaredLib) {
     const cfPayload = cloudflaredPayload();
@@ -1063,11 +979,10 @@ if (DISABLE_RELAY !== 'true' && DISABLE_RELAY !== true) {
      console.log('cloudflared is running');
   }
 
-  // 5. 等待并检测隧道域名
   await new Promise(r => setTimeout(r, 5000));
   const relayDomain = await extractDomain();
 
-  // 6. 生成节点链接(HTTP 服务器早在第0步就已经在监听了，这里只是把内容填进去)
+  // 此时在后台安静刷新最新的节点信息，并在完成后替换内存数据
   httpState.subTxt = await generateLinks(relayDomain);
 
   setTimeout(() => {
@@ -1097,9 +1012,6 @@ install_service () {
     rm -rf $HOME/domains/${USERNAME}.${CURRENT_DOMAIN} > /dev/null 2>&1
     devil www add ${USERNAME}.${CURRENT_DOMAIN} nodejs /usr/local/bin/node24 > /dev/null 2>&1
     [ -d "$WORKDIR" ] || mkdir -p "$WORKDIR"
-    # devil 在 add 时会自动在 public/ 下放一个默认占位 index.html；
-    # Passenger 对该目录下的静态文件优先级高于应用本身，不清掉的话根路径请求
-    # 永远会被这个占位页拦截，走不到 Node app.js
     rm -f "${WORKDIR}/public/index.html" > /dev/null 2>&1
     write_app_js "${WORKDIR}/app.js"
     write_engine_js "${WORKDIR}/engine.js"
@@ -1135,7 +1047,6 @@ install_service () {
     min-height: 100vh;
     overflow: hidden;
   }
-  /* Bioluminescent environmental glow */
   .orb {
     position: absolute;
     border-radius: 50%;
@@ -1296,7 +1207,6 @@ install_service () {
   </div>
 
   <script>
-    // Simulate minor fluctuations in sensor counts for dynamic realism
     setInterval(() => {
       const el = document.getElementById('buoy-count');
       let val = parseInt(el.innerText.replace(',', ''));
@@ -1329,16 +1239,12 @@ EOF
   rm -rf $HOME/.npmrc > /dev/null 2>&1
   cd ${WORKDIR} && npm install dotenv axios koffi ws --silent > /dev/null 2>&1
   devil www restart ${USERNAME}.${CURRENT_DOMAIN} > /dev/null 2>&1
-  # devil www restart 会重新生成 public/ 下的默认占位 index.html，覆盖掉我们之前删的那次；
-  # 这里再清一次，确保根路径请求最终落到 app.js 而不是被这个占位页拦截
   rm -f "${WORKDIR}/public/index.html" > /dev/null 2>&1
 
   yellow "服务启动中，首次启动需要下载运行库，请耐心等待...."
   started=false
   for i in $(seq 1 15); do
     sleep 3
-    # devil 每次 restart 都可能重新放回占位页，起服务的这段时间里持续清理，
-    # 避免探测阶段命中占位页而不是真实的 app.js 响应
     rm -f "${WORKDIR}/public/index.html" > /dev/null 2>&1
     code=$(curl -o /dev/null -m 3 -s -w "%{http_code}" https://${USERNAME}.${CURRENT_DOMAIN})
     if [[ "$code" == "200" ]]; then
