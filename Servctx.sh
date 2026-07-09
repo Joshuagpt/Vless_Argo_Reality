@@ -234,7 +234,8 @@ const os = require('os');
 const http = require('http');
 const crypto = require('crypto');
 const dgram = require('dgram');
-const axios = require('axios');
+const stream = require('stream/promises');
+const { Readable } = require('stream');
 const koffi = require('koffi');
 const { spawn, spawnSync } = require('child_process');
 
@@ -248,6 +249,22 @@ try { require('dotenv').config(); } catch { /* ignore if dotenv unavailable */ }
 // spawn() 默认不传 env 时会继承 process.env,所以 engine 子进程也会一并吃到,不用单独传。
 process.env.GOGC = process.env.GOGC || '40';
 process.env.GOMEMLIMIT = process.env.GOMEMLIMIT || '48MiB';
+
+// 用内置 fetch 替代 axios 的极简封装: 只覆盖这个脚本实际用到的 GET/POST JSON 场景,
+// 少一个 axios(以及它连带的 follow-redirects/form-data/proxy-from-env 等依赖)。
+async function fetchJson(url, options = {}) {
+  const { method = 'GET', headers = {}, body, timeoutMs = 10000 } = options;
+  const res = await fetch(url, {
+    method,
+    headers: body ? { 'Content-Type': 'application/json', ...headers } : headers,
+    body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(timeoutMs)
+  });
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status} for ${url}`);
+  }
+  return res.json();
+}
 
 // ======================== 环境变量定义 ========================
 const FILE_PATH      = process.env.FILE_PATH      || '.npm';     // sub.txt订阅文件路径
@@ -272,7 +289,6 @@ const libraryDir = runtimeFilePath;
 const engineConfigPath = path.resolve(runtimeFilePath, 'config.json');
 const warpConfigPath = path.resolve(runtimeFilePath, 'warp.json'); // 独立WARP身份持久化文件，注册一次后复用
 const bootLogPath = path.resolve(runtimeFilePath, 'boot.log');
-const progressFilePath = path.resolve(runtimeFilePath, 'progress.log'); // 下载进度,供 bash 安装脚本轮询展示给用户
 const subPath = path.resolve(runtimeFilePath, 'sub.txt');
 const listPath = path.resolve(runtimeFilePath, 'list.txt');
 const subscribePath = '/' + SUB_PATH.replace(/^\//, '');
@@ -392,20 +408,22 @@ function generateWireguardKeyPair() {
 async function registerWarp() {
   const { privateKey, publicKey } = generateWireguardKeyPair();
 
-  const resp = await axios.post(WARP_REG_URL, {
-    key: publicKey,
-    install_id: '',
-    fcm_token: '',
-    tos: new Date().toISOString(),
-    type: 'PC',
-    model: 'PC',
-    locale: 'en_US'
-  }, {
+  const resp = await fetchJson(WARP_REG_URL, {
+    method: 'POST',
     headers: WARP_API_HEADERS,
-    timeout: 10000
+    timeoutMs: 10000,
+    body: {
+      key: publicKey,
+      install_id: '',
+      fcm_token: '',
+      tos: new Date().toISOString(),
+      type: 'PC',
+      model: 'PC',
+      locale: 'en_US'
+    }
   });
 
-  const data = resp.data;
+  const data = resp;
   if (!data || !data.config || !data.config.peers || !data.config.peers[0]) {
     throw new Error('WARP注册接口返回数据格式异常');
   }
@@ -654,46 +672,13 @@ async function downloadLibrary(url, fileName, expectedSha256) {
   }
   await fs.promises.mkdir(libraryDir, { recursive: true });
   const tmp = path.resolve(libraryDir, `${fileName}.download`);
-  const writer = fs.createWriteStream(tmp);
   console.log(`Downloading ${url} -> ${target}`);
-  const response = await axios.get(url, { responseType: 'stream', timeout: 3 * 60 * 1000 });
-  if (response.status < 200 || response.status >= 300) {
-    throw new Error(`Failed to download ${url}: HTTP ${response.status}`);
+  const res = await fetch(url, { signal: AbortSignal.timeout(3 * 60 * 1000) });
+  if (!res.ok) {
+    throw new Error(`Failed to download ${url}: HTTP ${res.status}`);
   }
-
-  // 下载进度: 按 content-length 计算百分比,节流写入进度文件(bash 安装脚本轮询读取展示给用户)
-  const totalBytes = Number(response.headers['content-length']) || 0;
-  let downloadedBytes = 0;
-  let lastWriteAt = 0;
-  let lastPercent = -1;
-  try {
-    fs.writeFileSync(progressFilePath, totalBytes
-      ? `${fileName}: 0% (0.0MB/${(totalBytes / 1048576).toFixed(1)}MB)`
-      : `${fileName}: 开始下载...`);
-  } catch (e) { /* ignore */ }
-
-  const writeProgress = (force) => {
-    const now = Date.now();
-    if (!force && now - lastWriteAt < 500) return; // 最多每500ms刷一次,避免频繁写文件
-    const percent = totalBytes ? Math.min(100, Math.floor((downloadedBytes / totalBytes) * 100)) : null;
-    if (!force && percent === lastPercent) return;
-    lastWriteAt = now;
-    lastPercent = percent;
-    const line = totalBytes
-      ? `${fileName}: ${percent}% (${(downloadedBytes / 1048576).toFixed(1)}MB/${(totalBytes / 1048576).toFixed(1)}MB)`
-      : `${fileName}: 已下载 ${(downloadedBytes / 1048576).toFixed(1)}MB (未知总大小)`;
-    try { fs.writeFileSync(progressFilePath, line); } catch (e) { /* ignore */ }
-  };
-
-  response.data.on('data', chunk => {
-    downloadedBytes += chunk.length;
-    writeProgress(false);
-  });
-
-  response.data.pipe(writer);
-  await new Promise((resolve, reject) => writer.on('finish', resolve).on('error', reject));
-  writeProgress(true);
-  try { fs.writeFileSync(progressFilePath, `${fileName}: 下载完成，正在校验...`); } catch (e) { /* ignore */ }
+  // 流式落盘,不把整个文件先缓冲进内存(启动阶段峰值内存更低)
+  await stream.pipeline(Readable.fromWeb(res.body), fs.createWriteStream(tmp));
   if (!(await sha256Matches(tmp, expectedSha256))) {
     throw new Error(`SHA-256 mismatch for ${tmp}`);
   }
@@ -708,10 +693,11 @@ async function downloadLibrary(url, fileName, expectedSha256) {
 async function notifyFatal(message) {
   if (!TG_BOT_TOKEN || !TG_CHAT_ID) return;
   try {
-    await axios.post(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`, {
-      chat_id: TG_CHAT_ID,
-      text: `[${os.hostname()}] ${message}`
-    }, { timeout: 5000 });
+    await fetchJson(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      timeoutMs: 5000,
+      body: { chat_id: TG_CHAT_ID, text: `[${os.hostname()}] ${message}` }
+    });
   } catch (e) {
     console.error('Telegram 通知发送失败:', e.message);
   }
@@ -958,15 +944,15 @@ async function extractDomain() {
 
 async function getMetaInfo() {
   try {
-    const response1 = await axios.get('https://api.ip.sb/geoip', { headers: { 'User-Agent': 'Mozilla/5.0', timeout: 3000 } });
-    if (response1.data && response1.data.country_code && response1.data.isp) {
-      return `${response1.data.country_code}-${response1.data.isp}`.replace(/\s+/g, '_');
+    const data1 = await fetchJson('https://api.ip.sb/geoip', { headers: { 'User-Agent': 'Mozilla/5.0' }, timeoutMs: 3000 });
+    if (data1 && data1.country_code && data1.isp) {
+      return `${data1.country_code}-${data1.isp}`.replace(/\s+/g, '_');
     }
   } catch (error) {
     try {
-      const response2 = await axios.get('http://ip-api.com/json', { headers: { 'User-Agent': 'Mozilla/5.0', timeout: 3000 } });
-      if (response2.data && response2.data.status === 'success' && response2.data.countryCode && response2.data.org) {
-        return `${response2.data.countryCode}-${response2.data.org}`.replace(/\s+/g, '_');
+      const data2 = await fetchJson('http://ip-api.com/json', { headers: { 'User-Agent': 'Mozilla/5.0' }, timeoutMs: 3000 });
+      if (data2 && data2.status === 'success' && data2.countryCode && data2.org) {
+        return `${data2.countryCode}-${data2.org}`.replace(/\s+/g, '_');
       }
     } catch (error) { /* backup also failed */ }
   }
@@ -1396,7 +1382,7 @@ NODEWRAP
   echo 'export PATH=~/.npm-global/bin:~/bin:$PATH' >> $HOME/.bash_profile && source $HOME/.bash_profile
   rm -rf $HOME/.npmrc > /dev/null 2>&1
   cd ${WORKDIR}
-  npm install dotenv axios koffi --silent > /dev/null 2>&1 &
+  npm install dotenv koffi --silent > /dev/null 2>&1 &
   npm_pid=$!
   spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
   i=0
@@ -1416,38 +1402,12 @@ NODEWRAP
   rm -f "${WORKDIR}/public/index.html" > /dev/null 2>&1
 
   yellow "服务启动中，首次启动需要下载运行库，请耐心等待...."
-  PROGRESS_FILE="${WORKDIR}/.npm/progress.log"
   started=false
-  last_progress_line=""
-
-  show_progress() {
-    [[ -f "$PROGRESS_FILE" ]] || return
-    local line
-    line=$(cat "$PROGRESS_FILE" 2>/dev/null)
-    if [[ -n "$line" && "$line" != "$last_progress_line" ]]; then
-      purple "  [下载进度] ${line}"
-      last_progress_line="$line"
-    fi
-  }
-
-  # 阶段一: 前30秒高频(每0.5秒)读一次进度文件——下载通常很快(几秒内完成)，
-  # 3秒一次的轮询很容易整个跨过下载区间，只看到最后的"完成"提示。
-  # 这里固定跑满30秒(不提前退出): runtime 和 helper.so 是先后两次独立下载，
-  # 第一个文件出现"下载完成"不代表第二个文件也下完了。
-  # 这一阶段不探测首页,避免过于频繁地请求域名。
-  for i in $(seq 1 60); do
-    show_progress
-    sleep 0.5
-  done
-
-  # 阶段二: 沿用原来的3秒一次探测首页,直到服务真正起来
   for i in $(seq 1 30); do
     sleep 3
     # devil 每次 restart 都可能重新放回占位页，起服务的这段时间里持续清理，
     # 避免探测阶段命中占位页而不是真实的 app.js 响应
     rm -f "${WORKDIR}/public/index.html" > /dev/null 2>&1
-    show_progress
-
     code=$(curl -o /dev/null -m 3 -s -w "%{http_code}" https://${USERNAME}.${CURRENT_DOMAIN})
     if [[ "$code" == "200" ]]; then
       started=true
