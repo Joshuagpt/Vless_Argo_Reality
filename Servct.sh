@@ -752,7 +752,7 @@ warp_live_test() {
     test_log="${BIN_DIR}/.warp_live_test.log"
 
     for try_port in "${candidate_ports[@]}"; do
-        probe_port=$((RANDOM % 20000 + 20000))
+        probe_port=$PORT
 
         cat > "$test_conf" <<EOF
 {
