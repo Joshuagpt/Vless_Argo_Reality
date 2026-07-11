@@ -548,6 +548,53 @@ step "下载并校验核心程序(网络耗时最长的一步,请耐心等待)"
 download_binaries
 
 # ---------------------------------------------------------------
+# WARP 出站: 出站 UDP 连通性探测(第一道门槛,比二进制兼容性检测更前置)
+#   WireGuard 是纯 UDP 协议;serv00/ct8 这类共享主机沙箱经常只放行 TCP 出站,
+#   UDP 出站被整体丢弃,不管上层用什么方式包装、握手用的是官方 xray 还是第三方重命名
+#   二进制,都不可能测出"真通"——这也是为什么之前借一个临时 xray 进程跑 socks5 +
+#   cdn-cgi/trace 的方式会给出误导性的"成功": 一次性的握手小包/首个响应包可能侥幸
+#   挤过去,不代表 WARP 在持续实际流量下真的可用。
+#   这里改成脱离 xray/WireGuard 协议本身、只测最底层的"本机允许不允许发 UDP 包出去":
+#   直接用 bash 内建的 /dev/udp 伪设备,向公共 DNS(1.1.1.1/8.8.8.8 的 53 端口)发一个
+#   标准 DNS 查询包,能收到任意响应就说明 UDP 出站没有被整体屏蔽。
+#   这个探测方式和思路来自另一个已经在 serv00 上验证过的部署脚本(Servctx.sh 里的
+#   udpEgressProbe/detectUdpEgress),这里做的是同样的事,只是把 Node dgram 换成了
+#   bash /dev/udp。
+# ---------------------------------------------------------------
+udp_egress_probe() {
+    local host="$1" port="$2" timeout_s="${3:-3}"
+    # 标准 DNS 查询包: 查询 cloudflare.com 的 A 记录,内容本身不重要,
+    # 重要的是这个包能不能发出去、又能不能收到"任意"响应(哪怕是 REFUSED)。
+    local dns_query
+    dns_query=$'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x0a\x63\x6c\x6f\x75\x64\x66\x6c\x61\x72\x65\x03\x63\x6f\x6d\x00\x00\x01\x00\x01'
+    exec 9<>"/dev/udp/${host}/${port}" 2>/dev/null || return 1
+    printf '%s' "$dns_query" >&9 2>/dev/null
+    local ok=1
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$timeout_s" head -c 1 <&9 >/dev/null 2>&1 && ok=0
+    else
+        read -t "$timeout_s" -u 9 -n 1 _dummy 2>/dev/null && ok=0
+    fi
+    exec 9<&- 9>&- 2>/dev/null
+    return $ok
+}
+
+detect_udp_egress() {
+    purple "正在检测本机出站 UDP 连通性(WireGuard 依赖 UDP,serv00/ct8 等共享主机沙箱常整体屏蔽 UDP 出站)..."
+    local targets=("1.1.1.1:53" "8.8.8.8:53") t host port
+    for t in "${targets[@]}"; do
+        host="${t%%:*}"; port="${t##*:}"
+        if udp_egress_probe "$host" "$port" 3; then
+            green "UDP探测 ${t} -> 成功(收到响应),本机支持出站UDP,将继续尝试 WARP"
+            return 0
+        else
+            yellow "UDP探测 ${t} -> 失败(超时/无响应)"
+        fi
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------
 # WARP 出站: 平台能力检测
 #   本脚本使用的是第三方重命名的 freebsd 二进制,协议支持情况未知,
 #   不能假设它和官方 Xray-core 行为一致,必须用 -test 校验模式实测一份最小 wireguard 配置。
@@ -702,120 +749,61 @@ PYEOF
 }
 
 # ---------------------------------------------------------------
-# WARP 出站: 真实连通性探测(仅 install/re/update 主线跑一次,monitor.sh 巡检完全不碰这一段)
-#   - serv00 这类 FreeBSD 共享主机的端口是账号级 ACL,要靠 devil port add 逐个显式授权;
-#     连 127.0.0.1 的本地回环监听也受同一层限制,不是只管公网端口。
-#     之前用 `RANDOM % 20000 + 20000` 现挑一个从未登记过的端口做探测,xray 连本地监听都起不来,
-#     测的其实是"这个随机端口有没有权限",不是 WARP/WireGuard 本身通不通。
-#   - 这里改为直接复用 check_port() 已经通过 devil port add 拿到过账号授权的 $PORT。
-#     能这么做是因为: graceful_kill_pidfile 在本脚本更早的位置(check_port 之前)就已经把
-#     生产 web 进程杀掉了,此时到 start_services 真正重新拉起服务之前,$PORT 一直是空闲的,
-#     探测完把临时进程杀掉、端口原样奉还给后面的正式服务,不会冲突。
-#   - 探测方式: 起一个只含 socks 入站 + wireguard(WARP) 出站的临时 xray 实例监听在
-#     127.0.0.1:$PORT,通过它请求 Cloudflare 的 cdn-cgi/trace,核对返回里的 warp=on/plus,
-#     这是唯一能证明"WireGuard 握手 + 出站流量确实走通了 WARP"的实测方式,
-#     比之前只做 `-test` 静态配置校验(check_warp_supported)更进一步。
-#   - 任何一步失败(临时进程起不来、握手不通、trace 没有 warp=on)都优雅降级为关闭 WARP、
-#     回退直连,凭据文件保留不删,不影响其余部分正常安装;下次手动 re/update 会重新测一次。
+# WARP 出站: 针对已注册端点的诊断性探测(仅打印排障信息,不参与是否启用 WARP 的判断)
+#   给注册到手的真实 WARP endpoint(host:port) 发一个非法/非握手包,能收到任意响应就说明
+#   这个端点大概率可达;但 WireGuard 对不认识的包本身也不会回应,收不到响应不能反过来
+#   证明端点被墙——所以这里只做日志辅助排障,不会因为没收到响应就关闭 WARP。
+#   同样移植自 Servctx.sh 的 probeWarpEndpoint/diagnoseWarpEndpoint。
 # ---------------------------------------------------------------
-probe_warp_connectivity() {
-    [ "$WARP" = "1" ] || return 0
+probe_warp_endpoint() {
+    local host="$1" port="$2" timeout_s="${3:-3}"
+    exec 9<>"/dev/udp/${host}/${port}" 2>/dev/null || { echo "rejected"; return; }
+    printf '%s' $'\x01\x00\x00\x00\x00' >&9 2>/dev/null
+    local result="no_response"
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$timeout_s" head -c 1 <&9 >/dev/null 2>&1 && result="responded"
+    else
+        read -t "$timeout_s" -u 9 -n 1 _dummy 2>/dev/null && result="responded"
+    fi
+    exec 9<&- 9>&- 2>/dev/null
+    echo "$result"
+}
+
+diagnose_warp_endpoint() {
     [ -f "$WARP_PROFILE" ] || return 0
-
-    if [ "$HAVE_CURL" != 1 ]; then
-        yellow "未检测到 curl,无法对 WARP 出站做端到端连通性实测(仅 wget 无法可靠走 socks5 代理),将仅依据前面的静态兼容性检测结果继续,准确性可能不如实测"
-        return 0
-    fi
-
-    # 语法检查 + 加载凭据,与 generate_config() 里的做法保持一致(各自独立防御,不共享状态)
-    if ! bash -n "$WARP_PROFILE" 2>/dev/null; then
-        red "WARP 凭据文件语法异常,跳过连通性探测并关闭 WARP 出站"
-        export WARP=0
-        return 1
-    fi
-    local WARP_PRIVATE_KEY="" WARP_PEER_PUBLIC_KEY="" WARP_ADDRESS_V4="" WARP_ADDRESS_V6="" WARP_ENDPOINT="" WARP_RESERVED=""
+    bash -n "$WARP_PROFILE" 2>/dev/null || return 0
+    local WARP_ENDPOINT="" ep_host ep_port result
     # shellcheck disable=SC1090
     source "$WARP_PROFILE"
-    if [ -z "$WARP_PRIVATE_KEY" ] || [ -z "$WARP_PEER_PUBLIC_KEY" ]; then
-        red "WARP 凭据不完整,跳过连通性探测并关闭 WARP 出站"
-        export WARP=0
-        return 1
-    fi
+    [ -z "$WARP_ENDPOINT" ] && return 0
+    ep_host="${WARP_ENDPOINT%%:*}"
+    ep_port="${WARP_ENDPOINT##*:}"
+    [ "$ep_port" = "$ep_host" ] && ep_port=2408
 
-    purple "正在实测 WARP 出站连通性(复用 devil 已授权端口 ${PORT},不再用未登记过的随机端口)..."
-
-    local probe_conf="${BIN_DIR}/.warp_probe.json" probe_log="${BIN_DIR}/.warp_probe.log"
-    local probe_pidfile="${BIN_DIR}/.warp_probe.pid" probe_pid trace_out ok=0
-
-    cat > "$probe_conf" <<EOF
-{
-    "log": { "loglevel": "warning" },
-    "inbounds": [
-        {
-            "tag": "probe-in",
-            "listen": "127.0.0.1",
-            "port": ${PORT},
-            "protocol": "socks",
-            "settings": { "udp": false }
-        }
-    ],
-    "outbounds": [
-        {
-            "protocol": "wireguard",
-            "tag": "warp-out",
-            "settings": {
-                "secretKey": "${WARP_PRIVATE_KEY}",
-                "address": ["${WARP_ADDRESS_V4:-172.16.0.2/32}", "${WARP_ADDRESS_V6:-::/128}"],
-                "peers": [
-                    { "publicKey": "${WARP_PEER_PUBLIC_KEY}", "endpoint": "${WARP_ENDPOINT:-engage.cloudflareclient.com:2408}" }
-                ],
-                "reserved": [${WARP_RESERVED:-0,0,0}],
-                "mtu": 1280
-            }
-        }
-    ],
-    "routing": {
-        "rules": [ { "type": "field", "outboundTag": "warp-out", "network": "tcp,udp" } ]
-    }
-}
-EOF
-
-    ( cd "$BIN_DIR" && nohup ./web -c "$probe_conf" >"$probe_log" 2>&1 & echo $! > "$probe_pidfile" )
-    probe_pid=$(cat "$probe_pidfile" 2>/dev/null)
-
-    sleep 2
-    if [ -z "$probe_pid" ] || ! kill -0 "$probe_pid" >/dev/null 2>&1; then
-        red "WARP 探测进程启动后立即退出,大概率是端口占用/权限问题,而不是 WARP 本身不通;探测日志:"
-        [ -f "$probe_log" ] && sed 's/^/    /' "$probe_log" | tail -n 5
-        rm -f "$probe_conf" "$probe_log" "$probe_pidfile"
-        red "已自动关闭本次 WARP 出站(凭据仍保留在 ${WARP_PROFILE},不需要重新注册,下次 re/update 会重新测试)"
-        export WARP=0
-        return 1
-    fi
-
-    trace_out=$(curl -s --max-time 8 --socks5-hostname "127.0.0.1:${PORT}" "https://www.cloudflare.com/cdn-cgi/trace" 2>/dev/null)
-    echo "$trace_out" | grep -qE "warp=(on|plus)" && ok=1
-
-    kill -9 "$probe_pid" >/dev/null 2>&1
-    wait "$probe_pid" 2>/dev/null
-    rm -f "$probe_conf" "$probe_log" "$probe_pidfile"
-
-    if [ "$ok" = 1 ]; then
-        green "WARP 出站连通性实测通过(cdn-cgi/trace 确认 warp=on),后续将生成带 WARP 出站的配置"
-        return 0
-    else
-        red "WARP 出站连通性实测失败(WireGuard 握手/出站流量没有真正走通 WARP),已自动关闭 WARP 并回退直连"
-        red "凭据仍保留在 ${WARP_PROFILE},不需要重新注册;下次手动执行 re/update 时会重新测试一次"
-        export WARP=0
-        return 1
-    fi
+    purple "正在针对性探测 WARP 端点 ${ep_host}:${ep_port} ..."
+    result=$(probe_warp_endpoint "$ep_host" "$ep_port" 3)
+    case "$result" in
+        responded) green "端点探测 -> 收到响应,WARP 端点大概率可达" ;;
+        rejected)  yellow "端点探测 -> 连接被明确拒绝,该主机可能专门限制了 WARP 端点,即使继续使用 WARP 大概率也无法生效" ;;
+        *)         yellow "端点探测 -> 未收到任何响应。这不能100%证明被墙,仍会继续尝试使用 WARP;如果实测节点始终不通,大概率是针对性限制了 WARP 端点(而非通用 UDP 出站问题)" ;;
+    esac
 }
 
+# ---------------------------------------------------------------
+# WARP 出站主流程: UDP出站探测(阻断) -> 二进制兼容性探测(阻断) -> 注册/复用凭据 -> 端点诊断(不阻断)
+#   monitor.sh 巡检完全不碰这一段,WARP 用不用由这次 install/re/update 的结果决定,
+#   一直沿用到下次手动重新执行脚本为止。
+# ---------------------------------------------------------------
 if [ "$WARP" = "1" ]; then
-    step "配置 WARP 出站(平台兼容性检测 + 账号凭据 + 连通性实测)"
-    check_warp_supported
-    warp_register
-    probe_warp_connectivity
+    step "配置 WARP 出站(UDP出站探测 + 平台兼容性检测 + 账号凭据)"
+    if detect_udp_egress; then
+        check_warp_supported
+        warp_register
+        [ "$WARP" = "1" ] && diagnose_warp_endpoint
+    else
+        red "检测结果 -> 本机出站 UDP 疑似被整体屏蔽(serv00/ct8 等共享主机沙箱常见限制),WireGuard 无法工作,已自动关闭 WARP,其余部分正常安装"
+        export WARP=0
+    fi
 fi
 
 # ---------------------------------------------------------------
