@@ -1,7 +1,7 @@
 #!/bin/bash
 # ===================================================================
-# VLESS+WS+Argo 一键部署 —— serv00/ct8 专版（最终稳定版）
-# 特性：海洋主题目录、配置解耦、启动失败保护、稳健监控
+# VLESS+WS+Argo 一键部署 —— serv00/ct8 专版（最终修正版）
+# 修正：配置文件扩展名改为 .json，确保新版 Xray 识别
 # ===================================================================
 
 if [ -z "$BASH_VERSION" ]; then
@@ -109,8 +109,8 @@ FILE_PATH="${HOME}/domains/${USERNAME}.${CURRENT_DOMAIN}/public_html"
 BIN_DIR="${HOME}/.oceanus"
 STATE_FILE="${BIN_DIR}/.current.log"
 
-# 伪装文件名（可自由修改，监控会自动适配）
-CONFIG_FILE="index.dat"
+# 伪装文件名（关键修改：config.json -> service.json，保留 .json 扩展名）
+CONFIG_FILE="service.json"
 CRED_FILE="cache.db"
 TUNNEL_CONFIG="state.dat"
 
@@ -558,7 +558,6 @@ EOF
 step "生成节点配置"
 generate_config
 
-# ===================== 关键修改：启动服务并确保成功 =====================
 start_services() {
   cd "$BIN_DIR" || exit 1
 
@@ -697,8 +696,8 @@ if ! bash -n "$STATE_FILE" 2>/dev/null; then
 fi
 source "$STATE_FILE"
 
-# 兼容老版本状态文件（若未定义则默认为 index.dat）
-: "${SAVED_CONFIG_FILE:=index.dat}"
+# 默认配置文件为 service.json（兼容老版本）
+: "${SAVED_CONFIG_FILE:=service.json}"
 
 TG_TOKEN="$SAVED_TG_TOKEN"
 TG_ID="$SAVED_TG_ID"
