@@ -780,7 +780,17 @@ if [ "$WARP" = "1" ]; then
     step "配置 WARP 出站(平台兼容性检测 + 账号凭据)"
     check_warp_supported
     warp_register
-    check_warp_failover_supported
+    # check_warp_failover_supported 默认不再调用:
+    # 实测发现 -test 静态校验通过,不代表这个二进制的 Observatory 探测在运行时
+    # 真的探测成功过——很可能它的健康探测请求本身就没走通,导致 balancer 一直把
+    # warp-out 判定为不健康,所有流量永久 fallback 到 direct,表现为"装的时候显示
+    # 支持故障自动切回,但装出来的节点压根没套上 WARP"。WARP_FAILOVER 保持默认的
+    # 未设置状态,generate_config() 会因此退回没有 balancer 的静态死规则路由——
+    # 这是目前唯一被完整验证过端到端可用的配置。函数本体保留、没有删除,如果之后
+    # 想再验证 Observatory 在这个二进制上是否真能工作,可以手动取消下面这行注释,
+    # 但请务必在生成的节点上做一次真实的"断开WARP观察是否fallback"验证,不要只看
+    # 这里的探测日志。
+    # check_warp_failover_supported
 fi
 
 # ---------------------------------------------------------------
